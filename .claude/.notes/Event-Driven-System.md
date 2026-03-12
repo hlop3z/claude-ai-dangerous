@@ -1,21 +1,357 @@
-# Event-Driven System Architecture
+# Event-Driven System Architecture — Abstraction-First Design
 
-## 1. Problem Statement
-
-Traditional relational schemas couple business logic to table structure. Every new entity type, every field change, every relationship modification requires DDL migrations -- `ALTER TABLE`, `CREATE TABLE`, index rebuilds. At scale with multi-tenancy, this becomes:
-
-- **Migration hell**: N tenants x M schema changes = operational risk
-- **Rigid entity models**: adding a field to `products` requires deployment
-- **Coupled code**: application code mirrors table columns, changes cascade everywhere
-- **Lost history**: `UPDATE` overwrites previous state permanently
-
-### What We Want Instead
-
-Entities defined by **data + versioning**, not by typed columns. The schema lives inside JSONB payloads with a `schema_version` field. The Postgres tables are generic containers. Business logic evolves without DDL migrations. Full history via event sourcing.
+> **Design philosophy**: The architecture is defined by **ports** (abstract trait contracts), not by implementations. Infrastructure — databases, caches, auth providers, payment gateways — lives exclusively in adapters that implement port traits. **Rust is the sole implementation language.** Python-style pseudocode appears in this document only for readability when explaining contracts.
 
 ---
 
-## 2. Domain Model
+## 1. Problem Statement
+
+Traditional relational schemas couple business logic to table structure. Every new entity type, every field change, every relationship modification requires DDL migrations. At scale with multi-tenancy, this becomes:
+
+- **Migration hell**: N tenants × M schema changes = operational risk
+- **Rigid entity models**: adding a field requires deployment
+- **Coupled code**: application code mirrors storage columns, changes cascade everywhere
+- **Lost history**: mutable updates overwrite previous state permanently
+- **Vendor lock-in**: architecture is welded to specific databases and services
+
+### What We Want Instead
+
+Entities defined by **data + versioning**, not by typed columns. Business logic evolves without storage migrations. Full history via event sourcing. **Zero infrastructure dependencies in domain code** — every external system is accessed through an abstract port trait.
+
+---
+
+## 2. Architecture: Ports & Adapters in Rust
+
+Everything is Rust. Port contracts are `trait` definitions. Adapters are `struct` implementations. The composition root wires adapters to ports via dependency injection (`Arc<dyn Trait>`).
+
+```mermaid
+flowchart TD
+    subgraph Domain["Domain Core (zero deps)"]
+        PORTS[Port Traits\nasync_trait interfaces]
+        AGG[Aggregates\npure state machines]
+        VO[Value Objects\nMoney, EntityId, Version]
+        EVT[Domain Events\nimmutable structs]
+        UPC[Upcasters\npure functions]
+        ERR[Error Codes\ni18n-ready]
+    end
+
+    subgraph Application["Application Layer"]
+        CH[Command Handlers]
+        QH[Query Handlers]
+        PW[Projection Workers]
+        PM[Process Managers]
+        OR[Outbox Relay]
+        ACL[Anti-Corruption Layer]
+    end
+
+    subgraph Adapters["Adapter Layer (all I/O)"]
+        direction LR
+        subgraph Storage["Storage"]
+            PG[Postgres Adapter\nsqlx + PL/pgSQL]
+            MEM[In-Memory Adapter\nfor tests]
+        end
+        subgraph External["External"]
+            AUTH[OIDC Adapter\nZitadel / Keycloak]
+            PAY[Payment Adapter\nStripe / PayPal]
+            CACHE[Cache Adapter\nRedis]
+        end
+    end
+
+    CH --> PORTS
+    QH --> PORTS
+    PW --> PORTS
+    PM --> PORTS
+    ACL --> PORTS
+    CH --> AGG
+
+    PORTS -.->|"impl"| Storage
+    PORTS -.->|"impl"| External
+```
+
+### Why Rust
+
+| Concern            | How Rust Handles It                                                   |
+| ------------------ | --------------------------------------------------------------------- |
+| **Port contracts** | `#[async_trait] trait` — compile-time enforcement, zero-cost dispatch |
+| **State machines** | Typestate pattern — invalid transitions are compile errors            |
+| **Concurrency**    | Ownership model prevents data races in projection workers             |
+| **Serialization**  | `serde` handles JSONB ↔ struct with `schema_version` dispatch         |
+| **SQL safety**     | `sqlx` provides compile-time query verification                       |
+| **Performance**    | <1ms event append, high-throughput projection polling                 |
+| **Testing**        | In-memory adapter structs implement same traits as production         |
+
+---
+
+## 2.1 Industry-Validated Patterns (Research Findings)
+
+The abstractions in this architecture are not invented — they are distilled from mature, production-proven frameworks. This section documents what works, what leaks, and what to avoid, drawn from six production event sourcing systems.
+
+### Pattern 1: The Decider (Jérémie Chassaing, 2021)
+
+The most important abstraction pattern for event-sourced aggregates. Adopted by Oskar Dudycz, Emmett, delta-base, and Jet's Equinox.
+
+**Core definition** (F# original, language-agnostic):
+
+```
+Decider<Command, Event, State> = {
+    decide:       (command, state) → events[]       // business rules
+    evolve:       (state, event)   → state           // pure state transition
+    initialState: ()               → state           // starting point
+    isTerminal:   (state)          → bool            // lifecycle completion
+}
+```
+
+**Why this outperforms traditional OOP aggregates**:
+
+| Aspect                  | Traditional Aggregate                       | Decider                                                       |
+| ----------------------- | ------------------------------------------- | ------------------------------------------------------------- |
+| Side effects            | Methods mutate internal state + emit events | `decide` is pure: returns events, mutates nothing             |
+| Testing                 | Requires framework, mocking, setup          | Call functions directly: `decide(cmd, state)` → assert events |
+| Composition             | Aggregates don't compose                    | Deciders compose: two deciders merge into one                 |
+| Infrastructure coupling | Often mixed with persistence                | Zero I/O — `decide` and `evolve` are pure functions           |
+| Error handling          | Exceptions from deep inside methods         | Explicit: `Result<Vec<Event>, DomainError>`                   |
+
+**Rust mapping**: `decide` → method returning `Result<Vec<EventEnvelope>, DomainError>`. `evolve` → `fn apply(&mut self, event)`. `isTerminal` → typestate pattern makes terminal states compile-time unreachable.
+
+> **Source**: [Functional Event Sourcing Decider](https://thinkbeforecoding.com/post/2021/12/17/functional-event-sourcing-decider) — Jérémie Chassaing
+
+### Pattern 2: The cqrs-es Aggregate Trait (Rust, Production)
+
+The most mature Rust event sourcing library. Its trait design is the closest validated reference for our port definitions.
+
+```rust
+// From cqrs-es v0.5.0 — the proven Rust abstraction
+pub trait Aggregate: Default + Serialize + DeserializeOwned + Sync + Send {
+    type Command;
+    type Event: DomainEvent;
+    type Error: Error;
+    type Services: Send + Sync;   // injected dependencies (ports!)
+
+    const TYPE: &'static str;     // aggregate type identifier
+
+    fn handle(
+        &mut self,
+        command: Self::Command,
+        service: &Self::Services,  // ← ports injected here
+        sink: &EventSink<Self>,    // ← event emission channel
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn apply(&mut self, event: Self::Event);  // pure state transition
+}
+```
+
+**Key design decisions validated in production**:
+
+- `Services` associated type = dependency injection of ports without trait objects. The aggregate doesn't know what's behind `Services`, only the method signatures it needs.
+- `apply()` is synchronous and pure — "No business logic should be placed here."
+- `handle()` is async — it may need to call external services via ports.
+- `EventSink` decouples event emission from return values — events are pushed, not returned.
+- `Default` bound = aggregates have a natural initial state.
+- `Serialize + DeserializeOwned` bounds = snapshots are built-in at the type level.
+
+> **Source**: [cqrs-es docs.rs](https://docs.rs/cqrs-es/latest/cqrs_es/trait.Aggregate.html), [GitHub: serverlesstechnology/cqrs](https://github.com/serverlesstechnology/cqrs)
+
+### Pattern 3: Axon Framework Upcaster Chain (Java, 10+ years production)
+
+The most battle-tested upcasting abstraction. Our upcaster pipeline should mirror this pattern.
+
+```java
+// Core interface — processes streams of event representations
+interface Upcaster {
+    Stream<IntermediateEventRepresentation> upcast(
+        Stream<IntermediateEventRepresentation> events
+    );
+}
+
+// One-to-one transformation (most common case)
+abstract class SingleEventUpcaster extends Upcaster {
+    protected abstract boolean canUpcast(IntermediateEventRepresentation event);
+    protected abstract IntermediateEventRepresentation doUpcast(
+        IntermediateEventRepresentation event
+    );
+}
+
+// One-to-many transformation (split one event into multiple)
+abstract class EventMultiUpcaster extends Upcaster {
+    protected abstract boolean canUpcast(IntermediateEventRepresentation event);
+    protected abstract Stream<IntermediateEventRepresentation> doUpcast(
+        IntermediateEventRepresentation event
+    );
+}
+```
+
+**Critical insight**: Axon's `IntermediateEventRepresentation` gives upcasters access to event metadata (type, revision) without deserializing the payload. Upcasters transform the raw serialized form, avoiding the need to maintain old event type definitions. Our Rust upcasters should operate on `JsonValue`, not on deserialized structs.
+
+**Chain ordering**: Upcasters compose in sequence. Each upcaster's output feeds the next. Registration order = execution order. Spring's `@Order` annotation controls priority.
+
+> **Source**: [Axon Framework Event Versioning](https://docs.axoniq.io/axon-framework-reference/4.11/events/event-versioning/)
+
+### Pattern 4: Message DB / Eventide (PostgreSQL, Pure SQL)
+
+The reference implementation of an event store as pure Postgres functions. Our `PgEventStore` adapter should follow this proven interface.
+
+```sql
+-- The complete Message DB API (4 core functions):
+
+write_message(
+    id varchar,               -- client-generated message ID
+    stream_name varchar,       -- 'account-123' (entity stream) or 'account' (category)
+    type varchar,              -- event type name
+    data jsonb,                -- event payload
+    metadata jsonb DEFAULT NULL,
+    expected_version bigint DEFAULT NULL  -- optimistic concurrency
+)
+
+get_stream_messages(
+    stream_name varchar,       -- entity stream: 'account-123'
+    position bigint DEFAULT 0, -- start position within stream
+    batch_size bigint DEFAULT 1000,
+    condition varchar DEFAULT NULL  -- optional SQL WHERE clause
+)
+
+get_category_messages(
+    category_name varchar,     -- category: 'account' (all account-* streams)
+    position bigint DEFAULT 0, -- global position for checkpointing
+    batch_size bigint DEFAULT 1000,
+    correlation varchar DEFAULT NULL,         -- pub/sub filtering
+    consumer_group_member bigint DEFAULT NULL, -- competing consumers
+    consumer_group_size bigint DEFAULT NULL,
+    condition varchar DEFAULT NULL
+)
+
+get_last_stream_message(
+    stream_name varchar,
+    type varchar DEFAULT NULL  -- optionally filter by type
+)
+```
+
+**Key validated patterns**:
+
+- **Stream naming convention**: `{category}-{id}` (e.g., `account-abc123`). Category = aggregate type. This enables category-level subscriptions without extra indexes.
+- **Consumer groups built into the SQL function** — no external message broker needed. `consumer_group_member` and `consumer_group_size` enable competing consumers at the database level.
+- **`expected_version`** parameter = optimistic concurrency in one function call.
+- **Correlation filtering** built into `get_category_messages` — pub/sub routing at the query level.
+
+**Handler pattern** (Eventide Ruby):
+
+```
+Handler = {
+    dependencies: [write, store],       // injected ports
+    category:     "account",            // stream category
+    handle:       (message) → void      // process message, write results
+}
+```
+
+Handlers are callable objects. They declare dependencies (writer, entity store), a category, and handler blocks per message type. The consumer dispatches messages to matching handler blocks by type name matching.
+
+> **Source**: [Message DB Server Functions](http://docs.eventide-project.org/user-guide/message-db/server-functions.html), [Eventide Handlers](http://docs.eventide-project.org/user-guide/handlers.html)
+
+### Pattern 5: Marten Async Daemon (C#/.NET, Production at Scale)
+
+The most sophisticated projection infrastructure. Our projection worker design should learn from this.
+
+**Architecture**:
+
+- Runs as `IHostedService` — no external infrastructure beyond Postgres
+- **Solo mode**: single-node, auto-start
+- **HotCold mode**: multi-node with built-in leader election (one projection per node)
+- Tracks a **high water mark** — the furthest safely-processable event sequence
+- Each projection maintains its own checkpoint (sequence position)
+- Events processed **in order** across all registered async projections
+
+**Error handling** (three configurable policies):
+
+| Policy                    | Default (continuous) | Default (rebuild) | Purpose                           |
+| ------------------------- | -------------------- | ----------------- | --------------------------------- |
+| `SkipApplyErrors`         | true                 | false             | Ignore projection code failures   |
+| `SkipSerializationErrors` | true                 | false             | Overlook deserialization failures |
+| `SkipUnknownEvents`       | true                 | false             | Bypass unrecognized event types   |
+
+- Failed events go to a `DeadLetterEvent` table for later analysis
+- Shard pauses on failure unless skipping is enabled
+
+**Projection types** (proven taxonomy):
+
+| Type             | When                             | Consistency | Example                       |
+| ---------------- | -------------------------------- | ----------- | ----------------------------- |
+| **Inline**       | Same transaction as event append | Strong      | Uniqueness checks, counters   |
+| **Async**        | Background daemon                | Eventual    | Most read models, dashboards  |
+| **Live**         | On-demand replay                 | Strong      | Short streams, debugging      |
+| **Aggregate**    | Single-stream fold               | Both        | Order total, entity state     |
+| **Multi-stream** | Cross-stream grouping            | Eventual    | User activity across entities |
+| **Flat table**   | Denormalized rows                | Eventual    | Reporting, analytics          |
+
+**Rebuild capability**: `daemon.RebuildProjectionAsync("ProjectionName")` — full re-projection from event store. Also available via CLI: `dotnet run -- projections --rebuild`.
+
+**Health monitoring**: OpenTelemetry integration, `WaitForNonStaleProjectionDataAsync()` for tests, `IProjectionCoordinator` for progress tracking.
+
+> **Source**: [Marten Async Daemon](https://martendb.io/events/projections/async-daemon.html), [Oskar Dudycz: Projections in Marten Explained](https://event-driven.io/en/projections_in_marten_explained/)
+
+### Pattern 6: EventStoreDB/Kurrent Subscriptions
+
+Two subscription models proven in production across thousands of deployments.
+
+| Model          | State Management           | Delivery                                      | Use Case                                    |
+| -------------- | -------------------------- | --------------------------------------------- | ------------------------------------------- |
+| **Catch-up**   | Client-managed checkpoints | Exactly-once (if same-transaction checkpoint) | Read model projections                      |
+| **Persistent** | Server-managed state       | At-least-once with ACK/NACK                   | Competing consumers, distributed processing |
+
+**Catch-up subscription** (our primary model):
+
+```
+subscribe_to_stream_from(
+    stream_name,              // or $all for global
+    last_checkpoint: Position, // client tracks this
+    settings: CatchUpSubscriptionSettings,
+    event_handler: fn(event),
+    live_processing_started: fn(),  // signals caught up to head
+    subscription_dropped: fn(reason),
+)
+```
+
+**Best practice**: Store checkpoint in the same transaction as the projection write. This achieves exactly-once semantics without an inbox pattern.
+
+**Persistent subscription**:
+
+- Server maintains position per consumer group
+- Consumer group strategies: `RoundRobin` (load balance), `DispatchToSingle` (HA failover), `Pinned` (category-based ordering)
+- ACK/NACK model for at-least-once delivery
+
+> **Source**: [Kurrent Subscriptions](https://docs.kurrent.io/clients/tcp/dotnet/21.2/subscriptions), [Kurrent Guide to Event Stores](https://www.kurrent.io/guide-to-event-stores)
+
+### Production Lessons Learned (What Went Wrong)
+
+Compiled from production post-mortems and practitioner blog posts:
+
+**1. Don't expose internal events as integration events** (Vaughn Vernon, Chris Kiehl)
+
+Raw event subscriptions between services create coupling worse than shared databases. Every internal refactor breaks downstream consumers. **Mitigation**: Our `OutboxPublisher` port + Anti-Corruption Layer pattern. Domain events stay internal; integration events are separate lean contracts.
+
+**2. Keep streams short — design for bounded lifecycles** (Oskar Dudycz)
+
+Streams that grow indefinitely (e.g., a product that accumulates events forever) cause replay performance degradation. **Mitigation**: Design aggregates with natural lifecycle boundaries (Draft → Active → Completed). Use the "close the books" pattern: periodic lifecycle completion events that cap stream length. Only add snapshots when measured replay time > 100ms.
+
+**3. Materialization lag causes UX problems** (Chris Kiehl)
+
+After writes, clients query the read model and get stale data (404 for just-created entities, deleted items still visible). **Mitigation**: Return `{aggregate_id, version}` from writes. Client polls read model until `version >= expected_version`. Our architecture already includes this in the write path response.
+
+**4. Projection maintenance scales linearly with event types** (Chris Kiehl)
+
+Each new event type requires updating N projections. Adding, modifying, or removing an event type means spreading knowledge to every affected projection. **Mitigation**: Domain-scoped projection workers (our design). Each worker owns one domain. Cross-domain projections are explicit and few.
+
+**5. Build a replay debugging tool on day one** (Michał Ostruszka, SoftwareMill)
+
+The most valuable production tool: replay an aggregate's event stream up to a specific point to inspect intermediate state. Uses the same `evolve` function as production. **Mitigation**: Our `Decider` pattern makes this trivial — `events.iter().fold(initial_state(), evolve)` works in tests, debugging, and production identically.
+
+**6. Don't snapshot prematurely** (Kurrent, Oskar Dudycz)
+
+Snapshots add write amplification and versioning complexity. Most streams have < 100 events. **Mitigation**: Measure first. Snapshot only when measured replay time exceeds threshold. Store snapshots in a separate stream/table with retention policies.
+
+> **Sources**: [Event Sourcing is Hard](https://chriskiehl.com/article/event-sourcing-is-hard), [Should You Always Keep Streams Short?](https://event-driven.io/en/should_you_always_keep_streams_short/), [Things I Wish I Knew](https://softwaremill.com/things-i-wish-i-knew-when-i-started-with-event-sourcing-part-1/), [Snapshots in Event Sourcing](https://www.kurrent.io/blog/snapshots-in-event-sourcing)
+
+---
+
+## 3. Domain Model (Technology-Free)
 
 ### Core Entities
 
@@ -28,970 +364,787 @@ erDiagram
     AGGREGATE }|--|| AGGREGATE_TYPE : "classified as"
 
     TENANT {
-        uuid id PK
-        jsonb settings
-        int current_version
-        timestamptz created_at
+        id TenantId
+        settings Map
+        current_version Version
+        created_at Timestamp
     }
 
     AGGREGATE {
-        uuid id PK
-        uuid tenant_id FK
-        text domain "e.g. commerce, billing, iam"
-        text type "e.g. commerce.product"
-        int current_version
-        timestamptz created_at
+        id AggregateId
+        tenant_id TenantId
+        stream_domain DomainName
+        stream_entity EntityName
+        current_version Version
+        created_at Timestamp
     }
 
     EVENT {
-        uuid id PK
-        bigint global_position "monotonic sequence"
-        uuid tenant_id FK
-        uuid aggregate_id FK
-        text aggregate_type "e.g. commerce.product"
-        int aggregate_version
-        text event_type "e.g. commerce.product.created"
-        smallint schema_version "payload schema version"
-        jsonb payload
-        jsonb metadata "extensible operational baggage"
-        uuid correlation_id "request/saga trace"
-        uuid causation_id "parent event trace"
-        uuid user_id "acting user"
-        timestamptz created_at
+        id EventId
+        global_position Position
+        tenant_id TenantId
+        stream_domain DomainName
+        stream_entity EntityName
+        stream_id AggregateId
+        stream_version Version
+        event_action ActionName
+        event_version SchemaVersion
+        payload Document
+        metadata Document
+        correlation_id CorrelationId
+        causation_id CausationId
+        user_id UserId
+        created_at Timestamp
     }
 
     SNAPSHOT {
-        uuid aggregate_id FK
-        int version
-        jsonb state
-        timestamptz created_at
-    }
-
-    AGGREGATE_TYPE {
-        text name PK
-        text description
-    }
-
-    EVENT_PAYLOAD {
-        jsonb data "business data only"
+        aggregate_id AggregateId
+        version Version
+        state Document
+        created_at Timestamp
     }
 ```
 
-### The Generic Entity Model (no typed columns)
+> **Note**: No `UUID`, `JSONB`, `TEXT`, `BIGINT` — these are abstract value types. The adapter layer maps them to storage-specific types.
 
-Instead of creating a table per business object:
+### Value Objects (Domain Vocabulary)
 
-```mermaid
-flowchart LR
-    subgraph Traditional["Traditional (what we avoid)"]
-        P["products\n---\nid UUID\nname TEXT\nprice INT\nstatus TEXT"]
-        O["orders\n---\nid UUID\ncustomer_id UUID\ntotal INT\nstatus TEXT"]
-        U["users\n---\nid UUID\nemail TEXT\nrole TEXT"]
-    end
-
-    subgraph EventDriven["Event-Driven (what we use)"]
-        A["aggregates\n---\nid UUID\ntenant_id UUID\ntype TEXT\ncurrent_version INT"]
-        E["events\n---\naggregate_id UUID\nevent_type TEXT\npayload JSONB\nschema_version INT"]
-        EV["entity_versions\n---\nentity_id UUID\nversion INT\ndata JSONB"]
-    end
-
-    Traditional -->|"replace with"| EventDriven
+```
+TenantId        — opaque unique identifier
+AggregateId     — opaque unique identifier
+EventId         — opaque unique identifier
+Position        — monotonic, gapless, totally ordered integer
+Version         — non-negative integer, starts at 0
+SchemaVersion   — positive integer, starts at 1
+DomainName      — lowercase string, single segment ("commerce", "billing", "iam")
+EntityName      — lowercase string, single segment ("product", "order", "invoice")
+ActionName      — lowercase string, single segment ("created", "updated", "paid")
+AggregateType   — composite: "<domain>.<entity>" — reconstructed from DomainName + EntityName, never stored as one column
+EventType       — composite: "<domain>.<entity>.<action>" — reconstructed from DomainName + EntityName + ActionName, never stored as one column
+Document        — schema-free key-value structure (maps to JSONB, DynamoDB Map, etc.)
+Timestamp       — UTC datetime with timezone
+CorrelationId   — optional, traces request/saga across boundaries
+CausationId     — optional, traces parent event in causal chain
+Money           — amount (integer cents) + currency code
 ```
 
-**Key insight**: `type` is data, not schema. Adding a new entity type means inserting a row, not running a migration.
+### Namespaced Type System
 
-### Namespaced Type System: `<domain>.<type>`
+```
+Format:    <domain>.<entity>           — for aggregate types
+           <domain>.<entity>.<action>  — for event types
 
-All aggregate types and event types follow a `<domain>.<type>` convention. This creates natural bounded context boundaries at the data level.
+Validation: lowercase, dot-separated, 2-3 segments max
 
-```mermaid
-flowchart TD
-    subgraph commerce["commerce.*"]
-        CP["commerce.product"]
-        CO["commerce.order"]
-        CC["commerce.cart"]
-        CI["commerce.inventory"]
-    end
+Valid:     commerce.product
+           commerce.product.created
+           billing.invoice.paid
 
-    subgraph billing["billing.*"]
-        BS["billing.subscription"]
-        BI["billing.invoice"]
-        BP["billing.payment"]
-    end
-
-    subgraph iam["iam.*"]
-        IU["iam.user"]
-        IR["iam.role"]
-        IO["iam.organization"]
-    end
-
-    subgraph content["content.*"]
-        CD["content.document"]
-        CM["content.media"]
-        CT["content.template"]
-    end
-
-    subgraph notifications["notifications.*"]
-        NC["notifications.channel"]
-        NT["notifications.template"]
-        NL["notifications.log"]
-    end
+Invalid:   Product              (no domain prefix)
+           Commerce.Product     (uppercase)
+           a.b.c.d.e            (too deep)
 ```
 
-**Type format**: `<domain>.<entity>` for aggregates, `<domain>.<entity>.<action>` for events.
+**Why namespacing matters at the abstract level**:
 
-```text
-Aggregate types:
-  commerce.product
-  commerce.order
-  billing.subscription
-  iam.user
+| Benefit                | How                                                                        |
+| ---------------------- | -------------------------------------------------------------------------- |
+| **Service ownership**  | Each service owns a domain prefix                                          |
+| **Projection routing** | Workers subscribe by domain prefix                                         |
+| **Access control**     | Permissions map to domains: `can_read:commerce`                            |
+| **Event filtering**    | Port exposes `poll_by_domain(domain, after_position)`                      |
+| **Schema registry**    | Upcasters grouped by domain                                                |
+| **Cross-service flow** | `commerce.order.confirmed` → billing reacts with `billing.invoice.created` |
 
-Event types:
-  commerce.product.created
-  commerce.product.price_updated
-  commerce.order.confirmed
-  billing.subscription.renewed
-  iam.user.role_assigned
-```
+---
 
-**Why this matters at scale**:
+## 4. Port Definitions (Trait Contracts)
 
-| Benefit                  | How                                                                                                                          |
-| ------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| **Service ownership**    | Each service owns a domain prefix. `billing.*` is the billing service's territory.                                           |
-| **Projection routing**   | Projection workers subscribe by domain prefix: `commerce.*` worker builds product/order views.                               |
-| **Access control**       | Permissions map to domains: `can_read:commerce`, `can_write:billing`.                                                        |
-| **Event filtering**      | Query events by domain: `WHERE aggregate_type LIKE 'commerce.%'` uses the B-tree index.                                      |
-| **Schema registry**      | Upcasters are grouped by domain. Adding `commerce.wishlist` doesn't touch billing code.                                      |
-| **Cross-service events** | When `commerce.order.confirmed` fires, the billing worker reacts by creating `billing.invoice`. Clean event-driven coupling. |
+Ports define WHAT the system can do. They contain zero infrastructure knowledge. Each is an `#[async_trait]` trait. In-memory test adapters and production adapters both implement the same traits.
 
-**Validation rule**: types are lowercase, dot-separated, 2-3 segments max.
+> Python-style pseudocode is shown in comments for readability — the actual code is Rust.
 
-```text
-Valid:    commerce.product
-Valid:    iam.user
-Invalid:  Product           (no domain prefix)
-Invalid:  Commerce.Product  (no uppercase)
-Invalid:  a.b.c.d.e         (too deep)
-```
+```rust
+// ─── Value Objects ───────────────────────────────────────────────
 
-**Cross-domain event flow**:
+pub struct EventEnvelope {
+    pub event_action: String,         // "created" — just the action (SOC: domain/entity come from stream)
+    pub schema_version: i16,          // payload schema version for upcaster dispatch
+    pub payload: JsonValue,           // business data only
+    pub metadata: JsonValue,          // extensible operational baggage
+    pub correlation_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+}
 
-```mermaid
-sequenceDiagram
-    participant CS as Commerce Service
-    participant ES as Event Store
-    participant BS as Billing Service
-    participant NS as Notification Service
+pub struct StoredEvent {
+    pub id: Uuid,
+    pub global_position: i64,
+    pub tenant_id: Uuid,
+    pub stream_domain: String,        // "commerce" — bounded context (SOC)
+    pub stream_entity: String,        // "product" — aggregate type (SOC)
+    pub stream_id: Uuid,              // aggregate instance
+    pub stream_version: i32,
+    pub event_action: String,         // "created" — what happened (SOC)
+    pub event_version: i16,           // schema version for upcaster dispatch
+    pub payload: JsonValue,
+    pub metadata: JsonValue,
+    pub correlation_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
 
-    CS->>ES: Append commerce.order.confirmed
-    ES-->>BS: Subscribe commerce.order.*
-    BS->>BS: Create billing.invoice from order data
-    BS->>ES: Append billing.invoice.created
+impl StoredEvent {
+    /// Reconstruct fully-qualified names when needed (logging, display, debugging).
+    pub fn qualified_event_type(&self) -> String {
+        format!("{}.{}.{}", self.stream_domain, self.stream_entity, self.event_action)
+    }
+    pub fn qualified_aggregate_type(&self) -> String {
+        format!("{}.{}", self.stream_domain, self.stream_entity)
+    }
+}
 
-    ES-->>NS: Subscribe billing.invoice.*
-    NS->>NS: Send invoice email via notifications.log
-```
+pub struct Snapshot {
+    pub aggregate_id: Uuid,
+    pub version: i32,
+    pub state: JsonValue,
+    pub created_at: DateTime<Utc>,
+}
 
-**Index support**:
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
 
-```sql
--- Efficient domain-level queries via text_pattern_ops
-CREATE INDEX idx_events_domain ON events (aggregate_type text_pattern_ops);
+pub struct Relation {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub category: String,             // "schema" | "instance"
+    pub domain: String,
+    pub relation_type: String,        // "commerce.contains", "social.follows"
+    pub source_id: Uuid,
+    pub source_type: String,
+    pub target_id: Uuid,
+    pub target_type: String,
+    pub metadata: JsonValue,
+    pub version: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
 
--- Query all commerce events:
-SELECT * FROM events WHERE aggregate_type LIKE 'commerce.%';
+pub struct Claims {
+    pub tenant_id: Uuid,
+    pub user_id: Uuid,
+    pub roles: Vec<String>,
+    pub permissions: Vec<String>,
+}
 
--- Query specific entity:
-SELECT * FROM events WHERE aggregate_type = 'commerce.product';
-```
+pub struct DeadLetter {
+    pub id: Uuid,
+    pub event_id: Uuid,
+    pub global_position: i64,
+    pub handler_name: String,
+    pub error_message: String,
+    pub retry_count: i32,
+    pub status: String,               // "pending" | "retrying" | "exhausted" | "resolved"
+    pub created_at: DateTime<Utc>,
+}
 
-The `text_pattern_ops` index supports prefix matching (`LIKE 'prefix%'`) with B-tree efficiency: O(log n + k).
+pub struct ProcessState {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub process_type: String,
+    pub state: String,
+    pub data: JsonValue,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+}
 
-### Payload Schema Versioning
+pub type Result<T> = std::result::Result<T, DomainError>;
 
-```mermaid
-flowchart TD
-    E1["Event: ProductCreated\nschema_version: 1\ndata: {name, price}"]
-    E2["Event: ProductCreated\nschema_version: 2\ndata: {name, price, currency}"]
-    E3["Event: ProductCreated\nschema_version: 3\ndata: {name, price, currency, tax_category}"]
 
-    E1 -->|"upcaster v1->v2"| E2
-    E2 -->|"upcaster v2->v3"| E3
+// ─── Port: Event Store ───────────────────────────────────────────
+// Append-only event journal. The single source of truth.
+//
+// Invariants:
+//   - Events are immutable once appended
+//   - Global position is monotonic and gapless
+//   - Optimistic concurrency via expected_version check
+//   - One writer wins per (aggregate_id, version) pair
 
-    subgraph Upcaster["Upcaster Chain"]
-        U1["v1->v2: add currency='USD'"]
-        U2["v2->v3: add tax_category='standard'"]
-    end
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    /// Atomically append events to an aggregate stream.
+    /// Returns new aggregate version after append.
+    /// Fails with ConcurrencyConflict if current version != expected_version.
+    /// SOC: domain and entity are separate parameters, not combined.
+    async fn append(
+        &self,
+        tenant_id: Uuid, stream_id: Uuid,
+        stream_domain: &str, stream_entity: &str,
+        expected_version: i32,
+        events: &[EventEnvelope],
+    ) -> Result<i32>;
+
+    /// Load all events for an aggregate, ordered by version.
+    async fn load_stream(
+        &self, tenant_id: Uuid, stream_id: Uuid,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Load events for an aggregate starting from a specific version.
+    async fn load_stream_from(
+        &self, tenant_id: Uuid, stream_id: Uuid, from_version: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll events after a global position (global catch-up subscription).
+    async fn poll_global(
+        &self, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll by bounded context — equality match on stream_domain.
+    async fn poll_by_domain(
+        &self, domain: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll by entity type within a domain.
+    async fn poll_by_entity(
+        &self, domain: &str, entity: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll by specific event action across all entities.
+    async fn poll_by_action(
+        &self, action: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+}
+
+
+// ─── Port: Snapshot Store ────────────────────────────────────────
+// Caches aggregate state to avoid full event replay.
+
+#[async_trait]
+pub trait SnapshotStore: Send + Sync {
+    async fn load(&self, aggregate_id: Uuid) -> Result<Option<Snapshot>>;
+    async fn save(&self, aggregate_id: Uuid, version: i32, state: JsonValue) -> Result<()>;
+}
+
+
+// ─── Port: Read Model Store ─────────────────────────────────────
+// Generic document store keyed by (tenant, domain, entity, id).
+// No typed columns — entity structure lives in the document.
+// Adding a new entity type means writing a new projection, not a migration.
+// SOC: domain and entity are separate parameters.
+
+#[async_trait]
+pub trait ReadModelStore: Send + Sync {
+    async fn upsert(
+        &self, tenant_id: Uuid, domain: &str, entity: &str,
+        entity_id: Uuid, data: JsonValue, version: i32,
+    ) -> Result<()>;
+
+    async fn find_by_id(
+        &self, tenant_id: Uuid, domain: &str, entity: &str, entity_id: Uuid,
+    ) -> Result<Option<JsonValue>>;
+
+    async fn query(
+        &self, tenant_id: Uuid, domain: &str, entity: &str,
+        filters: Option<JsonValue>, cursor: Option<&str>, limit: i32,
+    ) -> Result<Page<JsonValue>>;
+
+    async fn query_by_domain(
+        &self, tenant_id: Uuid, domain: &str,
+        filters: Option<JsonValue>, cursor: Option<&str>, limit: i32,
+    ) -> Result<Page<JsonValue>>;
+
+    async fn delete(
+        &self, tenant_id: Uuid, domain: &str, entity: &str, entity_id: Uuid,
+    ) -> Result<()>;
+}
+
+
+// ─── Port: Relation Store ────────────────────────────────────────
+// Graph edge table for entity relationships.
+// Supports structural (order→line_items) and instance (user→follows→user).
+// This is a READ MODEL — always rebuildable from events.
+
+#[async_trait]
+pub trait RelationStore: Send + Sync {
+    async fn upsert(&self, tenant_id: Uuid, relation: &Relation) -> Result<()>;
+    async fn delete(
+        &self, tenant_id: Uuid, source_id: Uuid, target_id: Uuid, relation_type: &str,
+    ) -> Result<()>;
+    async fn query_forward(
+        &self, tenant_id: Uuid, source_id: Uuid, relation_type: &str,
+        cursor: Option<&str>, limit: i32,
+    ) -> Result<Page<Relation>>;
+    async fn query_reverse(
+        &self, tenant_id: Uuid, target_id: Uuid, relation_type: &str,
+        cursor: Option<&str>, limit: i32,
+    ) -> Result<Page<Relation>>;
+    async fn exists(
+        &self, tenant_id: Uuid, source_id: Uuid, target_id: Uuid, relation_type: &str,
+    ) -> Result<bool>;
+    async fn count(
+        &self, tenant_id: Uuid, target_id: Uuid, relation_type: &str,
+    ) -> Result<u64>;
+}
+
+
+// ─── Port: Identity Provider ────────────────────────────────────
+// Abstracts over OIDC providers (Zitadel, Keycloak, Auth0, etc.)
+// Domain code never knows which provider is behind this port.
+
+#[async_trait]
+pub trait IdentityProvider: Send + Sync {
+    async fn verify_token(&self, token: &str) -> Result<Claims>;
+    async fn get_user(&self, user_id: Uuid) -> Result<JsonValue>;
+    async fn has_permission(&self, user_id: Uuid, resource: &str, action: &str) -> Result<bool>;
+}
+
+
+// ─── Port: Payment Gateway ──────────────────────────────────────
+// Abstracts over payment processors (Stripe, PayPal, Adyen, etc.)
+
+#[async_trait]
+pub trait PaymentGateway: Send + Sync {
+    /// Returns charge reference ID.
+    async fn create_charge(
+        &self, amount_cents: i64, currency: &str, customer_ref: &str,
+        metadata: Option<JsonValue>,
+    ) -> Result<String>;
+    /// Full or partial refund. Returns refund reference ID.
+    async fn refund(&self, charge_ref: &str, amount_cents: Option<i64>) -> Result<String>;
+    /// Verify and parse webhook. Returns normalized payment event.
+    async fn handle_webhook(&self, payload: &[u8], signature: &str) -> Result<JsonValue>;
+}
+
+
+// ─── Port: Cache ────────────────────────────────────────────────
+// Abstracts over Redis, Memcached, in-memory, etc.
+
+#[async_trait]
+pub trait Cache: Send + Sync {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>>;
+    async fn set(&self, key: &str, value: &[u8], ttl_seconds: Option<u64>) -> Result<()>;
+    async fn invalidate(&self, key: &str) -> Result<()>;
+}
+
+
+// ─── Port: Encryption Key Store ─────────────────────────────────
+// Per-subject encryption keys for GDPR crypto-shredding.
+// Destroying a key renders all encrypted PII permanently unreadable.
+
+#[async_trait]
+pub trait EncryptionKeyStore: Send + Sync {
+    async fn create_key(&self, tenant_id: Uuid, subject_id: Uuid) -> Result<String>;
+    async fn get_key(&self, subject_id: Uuid) -> Result<Option<Vec<u8>>>;
+    async fn destroy_key(&self, subject_id: Uuid) -> Result<()>;
+}
+
+
+// ─── Port: Dead Letter Store ────────────────────────────────────
+// Captures poison events for inspection, retry, and resolution.
+
+#[async_trait]
+pub trait DeadLetterStore: Send + Sync {
+    async fn record_failure(
+        &self, event_id: Uuid, global_position: i64,
+        handler_name: &str, error_message: &str, error_stack: Option<&str>,
+    ) -> Result<()>;
+    async fn get_pending(&self, handler_name: &str, limit: i32) -> Result<Vec<DeadLetter>>;
+    async fn mark_resolved(&self, dead_letter_id: Uuid) -> Result<()>;
+    async fn retry(&self, dead_letter_id: Uuid) -> Result<()>;
+}
+
+
+// ─── Port: Process Manager Store ────────────────────────────────
+// Stateful saga/process manager coordination.
+
+#[async_trait]
+pub trait ProcessManagerStore: Send + Sync {
+    async fn load(&self, process_id: Uuid) -> Result<Option<ProcessState>>;
+    async fn save(
+        &self, process_id: Uuid, state: &ProcessState,
+        associations: Option<&HashMap<String, String>>,
+    ) -> Result<()>;
+    async fn find_by_association(&self, key: &str, value: &str) -> Result<Vec<Uuid>>;
+    async fn find_timed_out(&self, timeout_seconds: u64) -> Result<Vec<Uuid>>;
+}
+
+
+// ─── Port: Outbox Publisher ──────────────────────────────────────
+// Integration event relay. Domain events stay internal.
+// Integration events are lean public contracts for external consumers.
+
+#[async_trait]
+pub trait OutboxPublisher: Send + Sync {
+    async fn publish(
+        &self, tenant_id: Uuid,
+        domain: &str, entity: &str, action: &str,
+        schema_version: i16,
+        payload: JsonValue, correlation_id: Option<Uuid>,
+    ) -> Result<()>;
+    /// Relay unpublished events. Returns count relayed.
+    async fn relay_pending(&self, limit: i32) -> Result<i32>;
+}
+
+
+// ─── Port: Event Notifier ───────────────────────────────────────
+// Best-effort HINT for new events (optional optimization).
+// Abstracts over: Postgres LISTEN/NOTIFY, Redis Pub/Sub, etc.
+// A NoOp implementation is valid — system degrades to polling-only.
+
+#[async_trait]
+pub trait EventNotifier: Send + Sync {
+    async fn notify(&self, position: i64) -> Result<()>;
+    async fn subscribe(&self) -> Result<()>;
+}
+
+
+// ─── Port: Tenant Isolation ─────────────────────────────────────
+// Enforces tenant boundary at the infrastructure level.
+// Abstracts over: Postgres RLS, application-level WHERE, schema-per-tenant.
+
+#[async_trait]
+pub trait TenantIsolation: Send + Sync {
+    async fn set_tenant_context(&self, tenant_id: Uuid) -> Result<()>;
+    async fn clear_tenant_context(&self) -> Result<()>;
+}
+
+
+// ─── Port: Checkpoint Store ─────────────────────────────────────
+// Tracks projection worker progress through the event stream.
+
+#[async_trait]
+pub trait CheckpointStore: Send + Sync {
+    async fn get_position(&self, projection_name: &str) -> Result<i64>;
+    async fn save_position(&self, projection_name: &str, position: i64) -> Result<()>;
+}
+
+
+// ─── Port: Translator ───────────────────────────────────────────
+// i18n resolution for error messages and user-facing text.
+
+pub trait Translator: Send + Sync {
+    fn resolve(&self, code: &str, locale: &str, context: Option<&JsonValue>) -> String;
+}
 ```
 
 ---
 
-## 3. System Behavior
+## 5. Adapter Registry (Implementation Mapping)
 
-### 3.1 Write Path (Command Side)
+Each port can be satisfied by multiple adapters. The composition root wires the chosen adapter to each port.
 
 ```mermaid
-sequenceDiagram
-    participant Client
-    participant API as API Layer
-    participant Auth as Auth Middleware
-    participant Cmd as Command Handler
-    participant Agg as Aggregate
-    participant ES as Event Store
-    participant Bus as Event Bus
+flowchart TD
+    subgraph Ports["Ports (Trait Contracts)"]
+        ES_P[EventStore]
+        RM_P[ReadModelStore]
+        RS_P[RelationStore]
+        IP_P[IdentityProvider]
+        PG_P[PaymentGateway]
+        CA_P[Cache]
+        TI_P[TenantIsolation]
+        EN_P[EventNotifier]
+        EK_P[EncryptionKeyStore]
+        DL_P[DeadLetterStore]
+        PM_P[ProcessManagerStore]
+        OB_P[OutboxPublisher]
+        CP_P[CheckpointStore]
+    end
 
-    Client->>API: POST /commands/create-product
-    API->>Auth: Verify JWT (IdentityProvider port)
-    Auth-->>API: Claims {tenant_id, user_id, roles}
+    subgraph Adapters_Prod["Production Adapters"]
+        PG_ES[PgEventStore\nsqlx + PL/pgSQL]
+        PG_RM[PgReadModelStore\nJSONB + GIN]
+        PG_RS[PgRelationStore\nB-tree fwd/rev]
+        ZIT[ZitadelAdapter\nOIDC + gRPC]
+        KC[KeycloakAdapter\nOIDC + REST]
+        STR[StripeAdapter\nConnect API]
+        PP[PayPalAdapter\nREST API]
+        RED[RedisCache\nRedis Cluster]
+        RLS[PgTenantIsolation\nSET app.tenant_id]
+        LN[PgEventNotifier\nLISTEN/NOTIFY]
+    end
 
-    API->>Cmd: CreateProduct{tenant_id, data}
-    Cmd->>ES: Load events for aggregate_id
-    ES-->>Cmd: Vec of Event
+    subgraph Adapters_Test["Test Adapters"]
+        MEM_ES[InMemoryEventStore]
+        MEM_RM[InMemoryReadModel]
+        MEM_RS[InMemoryRelationStore]
+        FAKE_IP[FakeIdentityProvider]
+        FAKE_PG[FakePaymentGateway]
+        MEM_CA[InMemoryCache]
+        NOOP_TI[NoOpTenantIsolation]
+        NOOP_EN[NoOpEventNotifier]
+    end
 
-    Cmd->>Agg: Rebuild state from events
-    Agg->>Agg: Apply command (validate business rules)
-    Agg-->>Cmd: Vec of new Event
-
-    Cmd->>ES: Append events (optimistic concurrency check)
-    Note over ES: IF aggregate_version conflict THEN reject
-
-    ES-->>Cmd: Success (new version)
-    Cmd->>Bus: Publish domain events
-    Bus-->>Cmd: Acknowledged
-
-    Cmd-->>API: Result{aggregate_id, version}
-    API-->>Client: 201 {id, version}
+    ES_P -.-> PG_ES
+    ES_P -.-> MEM_ES
+    RM_P -.-> PG_RM
+    RM_P -.-> MEM_RM
+    RS_P -.-> PG_RS
+    RS_P -.-> MEM_RS
+    IP_P -.-> ZIT
+    IP_P -.-> KC
+    IP_P -.-> FAKE_IP
+    PG_P -.-> STR
+    PG_P -.-> PP
+    PG_P -.-> FAKE_PG
+    CA_P -.-> RED
+    CA_P -.-> MEM_CA
+    TI_P -.-> RLS
+    TI_P -.-> NOOP_TI
+    EN_P -.-> LN
+    EN_P -.-> NOOP_EN
 ```
 
-### 3.2 Read Path (Query Side)
+### Adapter Capability Matrix
+
+| Port                | Postgres Adapter                                           | DynamoDB Adapter (future)                       | In-Memory Adapter (tests)                         |
+| ------------------- | ---------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------- |
+| **EventStore**      | PL/pgSQL atomic append, gapless counter, UNIQUE constraint | Conditional writes on version, DynamoDB Streams | `HashMap<Uuid, Vec<Event>>`, simple version check |
+| **ReadModelStore**  | JSONB + GIN indexes, text_pattern_ops for prefix queries   | Single-table design, GSI for type queries       | Nested `HashMap`, linear scan for filters         |
+| **TenantIsolation** | RLS policies via `SET app.tenant_id`                       | Partition key = tenant_id, implicit isolation   | `tenant_id` filter in every method                |
+| **EventNotifier**   | LISTEN/NOTIFY trigger on events table                      | DynamoDB Streams + Lambda trigger               | `tokio::sync::Notify` signal                      |
+| **Cache**           | N/A                                                        | DAX                                             | `HashMap` with TTL via `Instant`                  |
+
+> **Key point**: The domain and application layers are identical regardless of which adapter column you choose. Switching from Postgres to DynamoDB means writing new adapters — zero domain code changes.
+
+---
+
+## 6. System Behavior (Technology-Free Flows)
+
+### 6.1 Write Path (Command Side)
 
 ```mermaid
 sequenceDiagram
     participant Client
-    participant API as API Layer
+    participant API as Transport Adapter
+    participant Auth as IdentityProvider port
+    participant TI as TenantIsolation port
+    participant Cmd as Command Handler
+    participant Agg as Aggregate (pure domain)
+    participant ES as EventStore port
+    participant Notifier as EventNotifier port
+
+    Client->>API: Request (HTTP, gRPC, CLI — adapter decides)
+    API->>Auth: verify_token(token)
+    Auth-->>API: Claims {tenant_id, user_id, roles}
+
+    API->>TI: set_tenant_context(tenant_id)
+    API->>Cmd: Execute command
+
+    Cmd->>ES: load_stream(tenant_id, aggregate_id)
+    ES-->>Cmd: event history
+
+    Cmd->>Agg: Rebuild state by folding events
+    Agg->>Agg: Validate command against business rules
+    Agg-->>Cmd: New events (or rejection)
+
+    Cmd->>ES: append(tenant_id, aggregate_id, domain, type, expected_version, events)
+    Note over ES: Adapter handles concurrency check internally
+
+    ES-->>Cmd: new_version (or ConcurrencyConflict)
+    Cmd->>Notifier: notify(new_position)
+    Cmd-->>API: Result{aggregate_id, version}
+    API-->>Client: Response
+```
+
+### 6.2 Read Path (Query Side)
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as Transport Adapter
     participant QH as Query Handler
-    participant Cache as Redis (optional)
-    participant RM as Read Model DB
+    participant Cache as Cache port
+    participant RM as ReadModelStore port
 
-    Client->>API: GET /products?tenant_id=X
-    API->>QH: ListProducts{tenant_id, filters, cursor}
+    Client->>API: Query request
+    API->>QH: Execute query
 
-    QH->>Cache: Check cache
+    QH->>Cache: get(cache_key)
     alt Cache Hit
         Cache-->>QH: Cached result
     else Cache Miss
-        QH->>RM: Query read model (RLS enforced)
-        RM-->>QH: Rows
-        QH->>Cache: Populate cache (TTL)
+        QH->>RM: query(tenant_id, entity_type, filters, cursor)
+        RM-->>QH: Page of results
+        QH->>Cache: set(cache_key, result, ttl)
     end
 
-    QH-->>API: Page of ProductView
-    API-->>Client: 200 {data, pagination}
+    QH-->>API: Page of views
+    API-->>Client: Response
 ```
 
-### 3.3 Projection Pipeline
+### 6.3 Projection Pipeline
 
 ```mermaid
 sequenceDiagram
-    participant ES as Event Store
+    participant CP as CheckpointStore port
+    participant ES as EventStore port
     participant PW as Projection Worker
-    participant RM as Read Model DB
-    participant CP as Checkpoint Store
+    participant UP as Upcaster Pipeline (pure function)
+    participant RM as ReadModelStore port
+    participant DL as DeadLetterStore port
 
     loop Continuous
-        PW->>CP: Get last processed position
-        CP-->>PW: Position N
+        PW->>CP: get_position(projection_name)
+        CP-->>PW: last_position
 
-        PW->>ES: Poll events after position N
-        ES-->>PW: Batch of events
+        PW->>ES: poll_by_domain(domain, last_position, batch_size)
+        ES-->>PW: batch of StoredEvents
 
         loop For each event
-            PW->>PW: Deserialize payload (handle schema_version)
-            PW->>PW: Apply projection logic (deterministic)
-            PW->>RM: Upsert read model row
+            PW->>UP: upcast(payload, schema_version) → current format
+            UP-->>PW: upcasted payload
+
+            alt Processing succeeds
+                PW->>RM: upsert(tenant_id, domain, entity_type, entity_id, data, version)
+            else Processing fails (after retries)
+                PW->>DL: record_failure(event_id, position, handler, error)
+                Note over PW: Skip poison event, continue processing
+            end
         end
 
-        PW->>CP: Update checkpoint to position N+batch_size
+        PW->>CP: save_position(projection_name, new_position)
     end
 ```
 
-### 3.4 Concurrency Model
+### 6.4 Concurrency Model (Abstract)
 
 ```mermaid
 flowchart TD
-    C1["Command: Update Product A"]
-    C2["Command: Update Product A"]
+    C1["Command A: Update aggregate X"]
+    C2["Command B: Update aggregate X"]
 
-    C1 --> L1["Load aggregate version = 5"]
-    C2 --> L2["Load aggregate version = 5"]
+    C1 --> L1["Load stream → version = 5"]
+    C2 --> L2["Load stream → version = 5"]
 
-    L1 --> W1["Append event version = 6"]
-    L2 --> W2["Append event version = 6"]
+    L1 --> W1["append(..., expected_version=5, ...)"]
+    L2 --> W2["append(..., expected_version=5, ...)"]
 
-    W1 --> S["UNIQUE(aggregate_id, version)\nFirst write wins"]
-    W2 --> S
+    W1 --> CHECK["Adapter enforces:\none-writer-wins per version"]
+    W2 --> CHECK
 
-    S -->|"C1 succeeds"| OK["Version 6 committed"]
-    S -->|"C2 fails"| RETRY["Conflict: retry or reject"]
+    CHECK -->|"A succeeds"| OK["Version 6 committed"]
+    CHECK -->|"B fails"| CONFLICT["ConcurrencyConflict → retry or reject"]
 ```
+
+> **Implementation note**: How the adapter enforces this varies:
+>
+> - Postgres: `UNIQUE(aggregate_id, aggregate_version)` constraint
+> - DynamoDB: conditional write `attribute_not_exists(version)`
+> - In-memory: version comparison under `Mutex`
 
 ---
 
-## 4. Abstraction Layers
+## 7. Schema Evolution Strategy
 
-### 4.1 Hexagonal Architecture
+### Payload Versioning
+
+Every event carries `schema_version` as a first-class field (not embedded in payload). The payload contains only business data:
+
+```json
+// schema_version = 2 (stored alongside event, not inside payload)
+{
+  "name": "Widget Pro",
+  "price": 2999,
+  "currency": "USD"
+}
+```
+
+### Upcaster Pipeline (Pure Functions)
 
 ```mermaid
-flowchart TD
-    subgraph Adapters["Adapters (I/O boundary)"]
-        HTTP["HTTP/REST Adapter"]
-        GRPC["gRPC Adapter"]
-        PG_ES["Postgres Event Store Adapter"]
-        PG_RM["Postgres Read Model Adapter"]
-        REDIS["Redis Cache Adapter"]
-        OIDC["OIDC Adapter\n(Zitadel / Keycloak)"]
-        STRIPE["Stripe Adapter"]
-        PAYPAL["PayPal Adapter"]
-    end
-
-    subgraph Application["Application Layer"]
-        CH["Command Handlers"]
-        QH["Query Handlers"]
-        PW["Projection Workers"]
-        PM["Process Managers"]
-        OR["Outbox Relay"]
-    end
-
-    subgraph Domain["Domain Core (zero deps)"]
-        AGG["Aggregates\n(pure state machines)"]
-        EVT["Domain Events\n(immutable value objects)"]
-        PORTS["Ports\n(traits/interfaces)"]
-        VO["Value Objects\n(Money, EntityId, Version)"]
-        ERR["Error Codes\n(i18n-ready)"]
-    end
-
-    HTTP --> CH
-    GRPC --> CH
-    CH --> AGG
-    CH --> PORTS
-    QH --> PORTS
-    PW --> PORTS
-
-    AGG --> EVT
-    AGG --> VO
-    AGG --> ERR
-
-    PORTS -.->|"implemented by"| PG_ES
-    PORTS -.->|"implemented by"| PG_RM
-    PORTS -.->|"implemented by"| REDIS
-    PORTS -.->|"implemented by"| OIDC
-    PORTS -.->|"implemented by"| STRIPE
-    PORTS -.->|"implemented by"| PAYPAL
+flowchart LR
+    RAW["Raw Event\nschema_version: 1"] --> U1["upcaster v1→v2\nadd currency='USD'"]
+    U1 --> U2["upcaster v2→v3\nadd tax_rate=0"]
+    U2 --> CURRENT["Current Format\nschema_version: 3"]
 ```
 
-### 4.2 Port Definitions
-
-```mermaid
-classDiagram
-    class EventStore {
-        <<interface>>
-        +append(tenant_id, domain, aggregate_id, expected_version, events) Result
-        +load_stream(tenant_id, aggregate_id) Vec~Event~
-        +load_stream_from(tenant_id, aggregate_id, from_version) Vec~Event~
-        +poll_by_domain(domain, after_position, limit) Vec~Event~
-        +subscribe(handler) Subscription
-    }
-
-    class SnapshotStore {
-        <<interface>>
-        +load(aggregate_id) Option~Snapshot~
-        +save(aggregate_id, version, state) Result
-    }
-
-    class ReadModelStore {
-        <<interface>>
-        +upsert(tenant_id, domain, entity_type, entity_id, data) Result
-        +query(tenant_id, entity_type, filters, cursor) Page
-        +query_by_domain(tenant_id, domain, filters, cursor) Page
-        +find_by_id(tenant_id, entity_type, entity_id) Option~View~
-        +delete(tenant_id, entity_type, entity_id) Result
-    }
-
-    class IdentityProvider {
-        <<interface>>
-        +verify_token(token) Result~Claims~
-        +get_user(user_id) Result~UserProfile~
-        +has_permission(user_id, resource, action) bool
-    }
-
-    class PaymentGateway {
-        <<interface>>
-        +create_charge(amount, customer, metadata) Result~ChargeId~
-        +refund(charge_id, amount) Result~RefundId~
-        +handle_webhook(payload, signature) Result~PaymentEvent~
-    }
-
-    class CachePort {
-        <<interface>>
-        +get(key) Option~bytes~
-        +set(key, value, ttl) Result
-        +invalidate(key) Result
-    }
-
-    class RelationStore {
-        <<interface>>
-        +upsert(tenant_id, relation) Result
-        +delete(tenant_id, source_id, target_id, relation_type) Result
-        +query_forward(tenant_id, source_id, relation_type, cursor) Page~Relation~
-        +query_reverse(tenant_id, target_id, relation_type, cursor) Page~Relation~
-        +exists(tenant_id, source_id, target_id, relation_type) bool
-        +count(tenant_id, target_id, relation_type) u64
-    }
-
-    class Translator {
-        <<interface>>
-        +resolve(code, locale, context) String
-    }
-
-    class EncryptionKeyStore {
-        <<interface>>
-        +create_key(tenant_id, subject_id) Result~KeyId~
-        +get_key(subject_id) Option~EncryptionKey~
-        +destroy_key(subject_id) Result
-    }
-
-    class DeadLetterStore {
-        <<interface>>
-        +record_failure(event_id, handler, error) Result
-        +get_pending(handler, limit) Vec~DeadLetter~
-        +mark_resolved(id) Result
-        +retry(id) Result
-    }
-
-    class ProcessManagerStore {
-        <<interface>>
-        +load(process_id) Option~ProcessState~
-        +save(process_id, state, associations) Result
-        +find_by_association(key, value) Vec~ProcessId~
-        +find_timed_out(timeout_threshold) Vec~ProcessId~
-    }
-
-    class OutboxPublisher {
-        <<interface>>
-        +publish(tenant_id, integration_event) Result
-        +relay_pending(limit) Vec~IntegrationEvent~
-        +mark_published(id) Result
-    }
-
-    EventStore <|.. PgEventStore : implements
-    RelationStore <|.. PgRelationStore : implements
-    SnapshotStore <|.. PgSnapshotStore : implements
-    ReadModelStore <|.. PgReadModelStore : implements
-    IdentityProvider <|.. ZitadelAdapter : implements
-    IdentityProvider <|.. KeycloakAdapter : implements
-    PaymentGateway <|.. StripeAdapter : implements
-    PaymentGateway <|.. PayPalAdapter : implements
-    CachePort <|.. RedisAdapter : implements
-    CachePort <|.. InMemoryCache : implements
-    Translator <|.. FileTranslator : implements
-    EncryptionKeyStore <|.. PgEncryptionKeyStore : implements
-    DeadLetterStore <|.. PgDeadLetterStore : implements
-    ProcessManagerStore <|.. PgProcessManagerStore : implements
-    OutboxPublisher <|.. PgOutboxPublisher : implements
-```
-
----
-
-## 5. Data Model (Postgres)
-
-### 5.1 Event Store Schema
-
-```sql
--- Single append-only table: the source of truth
-CREATE TABLE events (
-    id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    global_position   BIGINT NOT NULL,        -- gapless monotonic sequence (assigned in append_events)
-    tenant_id         UUID NOT NULL,
-    domain            TEXT NOT NULL,           -- bounded context: 'commerce', 'billing', 'iam'
-    aggregate_type    TEXT NOT NULL,           -- namespaced: 'commerce.product', 'billing.invoice'
-    aggregate_id      UUID NOT NULL,
-    aggregate_version INT NOT NULL,
-    event_type        TEXT NOT NULL,           -- namespaced: 'commerce.product.created'
-    schema_version    SMALLINT NOT NULL DEFAULT 1,  -- PROMOTED: payload schema version for upcaster dispatch
-    payload           JSONB NOT NULL,         -- business data (schema_version no longer embedded here)
-    metadata          JSONB NOT NULL DEFAULT '{}',  -- extensible operational baggage (headers, trace spans, etc.)
-    correlation_id    UUID,                   -- PROMOTED: request/saga trace ID for distributed tracing
-    causation_id      UUID,                   -- PROMOTED: parent event ID for causal chain tracing
-    user_id           UUID,                   -- PROMOTED: acting user for audit compliance
-    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    UNIQUE (aggregate_id, aggregate_version),  -- optimistic concurrency
-    UNIQUE (global_position)                   -- total ordering guarantee
-);
-
--- Gapless position counter (singleton row, incremented in append_events transaction)
-CREATE TABLE global_position_counter (
-    id       INT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
-    position BIGINT NOT NULL DEFAULT 0
-);
-INSERT INTO global_position_counter VALUES (1, 0);
-
--- Indexes for common access patterns
-CREATE INDEX idx_events_stream ON events (tenant_id, aggregate_id, aggregate_version);
-CREATE INDEX idx_events_type_prefix ON events (aggregate_type text_pattern_ops); -- LIKE 'commerce.%'
-
--- Projection polling indexes (use global_position, NOT created_at)
-CREATE INDEX idx_events_global_pos ON events (global_position);
-CREATE INDEX idx_events_domain_pos ON events (tenant_id, domain, global_position);
-CREATE INDEX idx_events_type_pos ON events (tenant_id, aggregate_type, global_position);
-
--- Tracing & audit indexes (partial -- only index non-null values)
-CREATE INDEX idx_events_correlation ON events (correlation_id) WHERE correlation_id IS NOT NULL;
-CREATE INDEX idx_events_causation ON events (causation_id) WHERE causation_id IS NOT NULL;
-CREATE INDEX idx_events_user ON events (tenant_id, user_id) WHERE user_id IS NOT NULL;
-```
-
-**Why promote fields from JSONB to columns?** Production event stores (Marten, Eventide, Axon) all use dedicated columns for fields that need SQL querying. Postgres has **zero statistics** on JSONB key distributions, causing up to 2000x wrong cardinality estimates in the query planner (source: Heap Engineering benchmarks). B-tree on a UUID column: <0.1ms lookup. GIN on JSONB: ~2.8ms best case with `@>` operator, and GIN **cannot** accelerate `->>` extraction queries at all.
-
-**Why `global_position` instead of `created_at` for checkpointing?** Using timestamps for projection ordering is a **correctness bug**: concurrent transactions can commit out of order, and timestamp collisions cause permanently skipped events. Every production event store uses a monotonic position: Marten's `seq_id`, Eventide's `global_position`, Axon's `global_index`.
-
-### 5.2 Aggregate Registry
-
-```sql
--- Identity + version pointer (no mutable business state)
-CREATE TABLE aggregates (
-    id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    domain          TEXT NOT NULL,       -- bounded context: 'commerce', 'billing', 'iam'
-    type            TEXT NOT NULL,       -- namespaced: 'commerce.product', 'billing.invoice'
-    current_version INT NOT NULL DEFAULT 0,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX idx_aggregates_tenant ON aggregates (tenant_id, type);
-CREATE INDEX idx_aggregates_domain ON aggregates (tenant_id, domain);
-CREATE INDEX idx_aggregates_type_prefix ON aggregates (type text_pattern_ops);
-```
-
-### 5.3 Snapshots
-
-```sql
-CREATE TABLE aggregate_snapshots (
-    aggregate_id    UUID NOT NULL REFERENCES aggregates(id),
-    version         INT NOT NULL,
-    state           JSONB NOT NULL,    -- serialized aggregate state
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    PRIMARY KEY (aggregate_id, version)
-);
-```
-
-### 5.4 Generic Read Model (no typed columns)
-
-```sql
--- One table serves ALL entity types for ALL tenants
-CREATE TABLE read_entities (
-    id              UUID NOT NULL,
-    tenant_id       UUID NOT NULL,
-    domain          TEXT NOT NULL,       -- bounded context: 'commerce', 'billing', 'iam'
-    entity_type     TEXT NOT NULL,       -- namespaced: 'commerce.product', 'billing.invoice'
-    data            JSONB NOT NULL,       -- denormalized view
-    version         INT NOT NULL,
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    PRIMARY KEY (tenant_id, entity_type, id)
-);
-
--- Fast lookups by domain and type
-CREATE INDEX idx_read_entities_domain ON read_entities (tenant_id, domain, updated_at DESC);
-CREATE INDEX idx_read_entities_type ON read_entities (tenant_id, entity_type, updated_at DESC);
-CREATE INDEX idx_read_entities_type_prefix ON read_entities (entity_type text_pattern_ops);
-
--- GIN index for querying inside JSONB
-CREATE INDEX idx_read_entities_data ON read_entities USING GIN (data jsonb_path_ops);
-```
-
-### 5.5 Relationship Type Registry
-
-```sql
--- Declares valid relationship types (like aggregate_types, no DDL to add new ones)
--- Inspired by Salesforce MT_Fields relationship metadata and Shopify typed references
-CREATE TABLE relationship_types (
-    name            TEXT PRIMARY KEY,                   -- 'commerce.contains', 'social.follows'
-    description     TEXT,
-    source_type     TEXT NOT NULL,                      -- 'commerce.order'
-    target_type     TEXT NOT NULL,                      -- 'commerce.line_item'
-    directionality  TEXT NOT NULL DEFAULT 'directed'    -- 'directed' | 'bidirectional'
-                    CHECK (directionality IN ('directed', 'bidirectional')),
-    cardinality     TEXT NOT NULL DEFAULT 'many_to_many' -- 'one_to_one' | 'one_to_many' | 'many_to_many'
-                    CHECK (cardinality IN ('one_to_one', 'one_to_many', 'many_to_many')),
-    metadata_schema JSONB,                              -- optional JSON Schema for edge metadata validation
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-```
-
-Adding a new relationship type means inserting a row, not running a migration -- consistent with the generic entity philosophy. The registry enables validation (source/target type checking), discoverability (API clients query valid edges), and cardinality enforcement.
-
-### 5.6 Entity Relations (Graph Edge Table)
-
-```sql
--- Single table for BOTH structural and instance relationships
--- This is a READ MODEL (projection), not source of truth -- always rebuildable from events
--- Inspired by Salesforce MT_Relationships pivot table
-CREATE TABLE entity_relations (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       UUID NOT NULL,
-
-    -- Classification
-    category        TEXT NOT NULL,            -- 'schema' | 'instance'
-    domain          TEXT NOT NULL,            -- 'commerce', 'social', 'iam'
-    relation_type   TEXT NOT NULL,            -- 'commerce.contains', 'social.follows', 'iam.member_of'
-
-    -- Directed edge: source -> target
-    source_id       UUID NOT NULL,
-    source_type     TEXT NOT NULL,            -- 'commerce.order', 'iam.user'
-    target_id       UUID NOT NULL,
-    target_type     TEXT NOT NULL,            -- 'commerce.line_item', 'iam.user'
-
-    -- Relationship properties (varies by relation_type)
-    metadata        JSONB NOT NULL DEFAULT '{}',
-    -- Examples:
-    --   social.follows:     {"notifications": true}
-    --   iam.member_of:      {"role": "admin", "valid_from": "...", "valid_until": "..."}
-    --   commerce.contains:  {"sort_order": 3, "quantity": 2}
-
-    -- Projection tracking
-    version         INT NOT NULL DEFAULT 1,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    -- Prevent duplicate edges
-    UNIQUE (tenant_id, source_id, target_id, relation_type)
-);
-
--- Forward traversal: "order's line items", "user's following list"
-CREATE INDEX idx_rel_forward ON entity_relations (tenant_id, source_id, relation_type, created_at DESC);
-
--- Reverse traversal: "user's followers", "which orders contain product X"
-CREATE INDEX idx_rel_reverse ON entity_relations (tenant_id, target_id, relation_type, created_at DESC);
-
--- Type-filtered reverse: "find all iam.user followers of X" (excluding bots)
-CREATE INDEX idx_rel_reverse_typed ON entity_relations (tenant_id, target_id, relation_type, source_type);
-
--- Domain-scoped: "all relationships in commerce domain"
-CREATE INDEX idx_rel_domain ON entity_relations (tenant_id, domain, relation_type, created_at DESC);
-
--- Schema-only (partial index, very small -- only type-level definitions)
-CREATE INDEX idx_rel_schema ON entity_relations (tenant_id, source_type, relation_type)
-    WHERE category = 'schema';
-
--- Metadata queries: "find relations where role = 'admin'"
-CREATE INDEX idx_rel_metadata ON entity_relations USING GIN (metadata jsonb_path_ops);
-```
-
-**Two relationship categories in ONE table:**
-
-| Category                    | Example                     | Cardinality           | Owned By            | Event Pattern                   |
-| --------------------------- | --------------------------- | --------------------- | ------------------- | ------------------------------- |
-| **Schema** (type-level)     | "order contains line_items" | Low (tens per tenant) | Type definition     | Defined once, rarely changes    |
-| **Instance** (entity-level) | "user A follows user B"     | High (millions)       | Dedicated aggregate | `social.follow.created/removed` |
-
-One table with a `category` discriminator (not two tables) because: same column structure, same indexes, same RLS policy. Partial index `WHERE category = 'schema'` gives the same selectivity as a separate table.
-
-**Why a separate table instead of JSONB arrays in `read_entities.data`?**
-
-| Operation                        | Relations table + B-tree | JSONB array of IDs                                 |
-| -------------------------------- | ------------------------ | -------------------------------------------------- |
-| "20 newest followers of user X"  | Index scan, stop at 20   | Unnest full array O(n), sort, limit                |
-| "Does A follow B?"               | Point lookup O(log n)    | Containment check O(log n)                         |
-| "Follow user B"                  | INSERT one row           | Read full JSONB, append, rewrite entire column     |
-| Entity with 1M followers         | 1M rows (~80MB)          | 1M-element array (~40MB per JSONB, destroys TOAST) |
-| Reverse query ("who follows X?") | Reverse index scan       | **Impossible** without scanning every entity       |
-
-**Hybrid embedding**: For bounded structural relations (order has <100 line items), embed a denormalized summary in `read_entities.data` AND maintain the full edge in `entity_relations`. The projection worker writes to both atomically. For unbounded social/instance relations (followers), use the relations table exclusively.
-
-**Bidirectional relationships** (friends): Insert TWO rows (A->B and B->A) in the same transaction. This keeps queries uniform -- always query by `source_id`, regardless of directionality. 2x storage is negligible; query simplicity is worth it.
-
-**Relationship events** follow two patterns:
-
-- **Structural** (events on parent aggregate): `commerce.order.line_item_added` -> projection inserts relation row
-- **Social/Instance** (dedicated relationship aggregates): `social.follow.created` -> projection inserts forward edge
-
-```text
-Relationship event types (following <domain>.<entity>.<action> convention):
-  social.follow.created
-  social.follow.removed
-  social.friendship.accepted
-  social.friendship.removed
-  iam.membership.granted
-  iam.membership.role_changed
-  iam.membership.revoked
-  commerce.assignment.created     -- product assigned to category
-  commerce.assignment.removed
-```
-
-### 5.7 Projection Checkpoints
-
-```sql
-CREATE TABLE projection_checkpoints (
-    projection_name TEXT NOT NULL,       -- e.g. 'commerce_products', 'billing_invoices'
-    domain          TEXT NOT NULL,       -- which domain this projection consumes
-    last_position   BIGINT NOT NULL DEFAULT 0,
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    PRIMARY KEY (projection_name)
-);
-
-CREATE INDEX idx_checkpoints_domain ON projection_checkpoints (domain);
-```
-
-### 5.6 Multi-Tenancy via RLS
-
-```sql
--- Enable RLS on all tables
-ALTER TABLE events ENABLE ROW LEVEL SECURITY;
-ALTER TABLE aggregates ENABLE ROW LEVEL SECURITY;
-ALTER TABLE read_entities ENABLE ROW LEVEL SECURITY;
-ALTER TABLE entity_relations ENABLE ROW LEVEL SECURITY;
-
--- Policy: tenant can only see their own data
-CREATE POLICY tenant_isolation_events ON events
-    USING (tenant_id = current_setting('app.tenant_id')::UUID);
-
-CREATE POLICY tenant_isolation_aggregates ON aggregates
-    USING (tenant_id = current_setting('app.tenant_id')::UUID);
-
-CREATE POLICY tenant_isolation_reads ON read_entities
-    USING (tenant_id = current_setting('app.tenant_id')::UUID);
-
-CREATE POLICY tenant_isolation_relations ON entity_relations
-    USING (tenant_id = current_setting('app.tenant_id')::UUID);
-```
-
-### 5.7 Entity Relationship Diagram
-
-```mermaid
-erDiagram
-    events ||--|| aggregates : "belongs to"
-    aggregate_snapshots ||--|| aggregates : "caches state of"
-    read_entities }|--|| aggregates : "projected from"
-    entity_relations }|--|| read_entities : "connects"
-    entity_relations }|--|| relationship_types : "typed by"
-    projection_checkpoints ||--o{ read_entities : "tracks position for"
-    encryption_keys ||--o{ events : "encrypts PII in"
-    dead_letter_events }|--|| events : "failed processing of"
-    process_managers ||--o{ process_associations : "identified by"
-    integration_outbox }|--|| events : "derived from"
-
-    events {
-        uuid id PK
-        bigint global_position "monotonic sequence"
-        uuid tenant_id
-        text domain "bounded context"
-        text aggregate_type "namespaced type"
-        uuid aggregate_id FK
-        int aggregate_version
-        text event_type "namespaced event"
-        smallint schema_version "payload schema version"
-        jsonb payload "business data"
-        jsonb metadata "extensible operational baggage"
-        uuid correlation_id "request/saga trace"
-        uuid causation_id "parent event trace"
-        uuid user_id "acting user"
-        timestamptz created_at
-    }
-
-    aggregates {
-        uuid id PK
-        uuid tenant_id
-        text domain "bounded context"
-        text type "namespaced type"
-        int current_version
-        timestamptz created_at
-    }
-
-    aggregate_snapshots {
-        uuid aggregate_id PK_FK
-        int version PK
-        jsonb state
-        timestamptz created_at
-    }
-
-    read_entities {
-        uuid id PK
-        uuid tenant_id PK
-        text domain "bounded context"
-        text entity_type PK "namespaced type"
-        jsonb data
-        int version
-        timestamptz updated_at
-    }
-
-    entity_relations {
-        uuid id PK
-        uuid tenant_id
-        text category "schema or instance"
-        text domain "bounded context"
-        text relation_type "namespaced relation"
-        uuid source_id "from entity"
-        text source_type "from entity type"
-        uuid target_id "to entity"
-        text target_type "to entity type"
-        jsonb metadata "relationship properties"
-        int version
-        timestamptz created_at
-        timestamptz updated_at
-    }
-
-    relationship_types {
-        text name PK "e.g. commerce.contains"
-        text source_type "valid source"
-        text target_type "valid target"
-        text directionality "directed or bidirectional"
-        text cardinality "1:1, 1:N, M:N"
-    }
-
-    projection_checkpoints {
-        text projection_name PK
-        text domain "scoped to bounded context"
-        bigint last_position "references global_position"
-        timestamptz updated_at
-    }
-
-    encryption_keys {
-        uuid subject_id PK
-        uuid tenant_id
-        bytea encryption_key "AES-256"
-        text algorithm
-        timestamptz created_at
-        timestamptz destroyed_at "NULL until erasure"
-    }
-
-    dead_letter_events {
-        uuid id PK
-        uuid event_id
-        bigint global_position
-        text handler_name "failed projection"
-        text error_message
-        int retry_count
-        text status "pending|exhausted|resolved"
-        timestamptz created_at
-    }
-
-    process_managers {
-        uuid id PK
-        uuid tenant_id
-        text process_type "order_fulfillment etc"
-        text state "current step"
-        jsonb data "accumulated context"
-        timestamptz started_at
-        timestamptz completed_at
-    }
-
-    process_associations {
-        uuid process_id FK
-        text association_key "order_id etc"
-        text association_val
-    }
-
-    integration_outbox {
-        uuid id PK
-        uuid tenant_id
-        text event_type "integration event"
-        smallint schema_version
-        jsonb payload "lean public contract"
-        uuid correlation_id
-        timestamptz created_at
-        timestamptz published_at "NULL until relayed"
-    }
-```
-
----
-
-## 5.8 Append Function (Optimistic Concurrency)
-
-```sql
--- PL/pgSQL function for atomic event append with version check
--- Similar to Eventide's write_message pattern
--- Now includes gapless global_position and promoted metadata columns
-CREATE OR REPLACE FUNCTION append_events(
-    p_tenant_id UUID,
-    p_aggregate_id UUID,
-    p_domain TEXT,            -- bounded context: 'commerce', 'billing', 'iam'
-    p_aggregate_type TEXT,    -- namespaced: 'commerce.product'
-    p_expected_version INT,
-    p_events JSONB  -- array of {event_type, schema_version, payload, metadata, correlation_id, causation_id, user_id}
-) RETURNS INT AS $$
-DECLARE
-    v_current_version INT;
-    v_new_version INT;
-    v_event JSONB;
-    v_global_position BIGINT;
-BEGIN
-    -- Lock the aggregate row
-    SELECT current_version INTO v_current_version
-    FROM aggregates
-    WHERE id = p_aggregate_id AND tenant_id = p_tenant_id
-    FOR UPDATE;
-
-    -- First event for this aggregate
-    IF v_current_version IS NULL THEN
-        INSERT INTO aggregates (id, tenant_id, domain, type, current_version)
-        VALUES (p_aggregate_id, p_tenant_id, p_domain, p_aggregate_type, 0);
-        v_current_version := 0;
-    END IF;
-
-    -- Optimistic concurrency check
-    IF v_current_version != p_expected_version THEN
-        RAISE EXCEPTION 'concurrency_conflict: expected %, got %',
-            p_expected_version, v_current_version;
-    END IF;
-
-    -- Append each event
-    v_new_version := v_current_version;
-    FOR v_event IN SELECT * FROM jsonb_array_elements(p_events)
-    LOOP
-        v_new_version := v_new_version + 1;
-
-        -- Gapless global position: increment counter in same transaction
-        UPDATE global_position_counter SET position = position + 1
-            RETURNING position INTO v_global_position;
-
-        INSERT INTO events (
-            global_position, tenant_id, domain, aggregate_type, aggregate_id,
-            aggregate_version, event_type, schema_version, payload, metadata,
-            correlation_id, causation_id, user_id
-        ) VALUES (
-            v_global_position, p_tenant_id, p_domain, p_aggregate_type,
-            p_aggregate_id, v_new_version,
-            v_event->>'event_type',
-            COALESCE((v_event->>'schema_version')::SMALLINT, 1),
-            v_event->'payload',
-            COALESCE(v_event->'metadata', '{}'::JSONB),
-            (v_event->>'correlation_id')::UUID,
-            (v_event->>'causation_id')::UUID,
-            (v_event->>'user_id')::UUID
+**Rules**:
+
+- Upcasters are **pure functions**: `(payload, from_version) → payload`
+- They run lazily at read time (no rewriting stored events)
+- Each upcaster handles exactly one version increment
+- Upcasters compose: `v1 → v2 → v3 → ... → current`
+- Old events are NEVER mutated in storage
+
+**Rust implementation**:
+
+```rust
+// upcasters.rs — Pure functions, no I/O, fully testable
+// SOC: upcaster key is (domain, entity, action, version) — each segment independent.
+
+/// Key: (domain, entity, action, from_version) → transform function
+type Upcaster = fn(JsonValue) -> JsonValue;
+type UpcasterKey = (String, String, String, i16); // (domain, entity, action, from_version)
+
+pub struct UpcasterRegistry {
+    registry: HashMap<UpcasterKey, Upcaster>,
+}
+
+impl UpcasterRegistry {
+    pub fn register(
+        &mut self, domain: &str, entity: &str, action: &str,
+        from_version: i16, upcaster: Upcaster,
+    ) {
+        self.registry.insert(
+            (domain.into(), entity.into(), action.into(), from_version),
+            upcaster,
         );
-    END LOOP;
+    }
 
-    -- Update version pointer
-    UPDATE aggregates SET current_version = v_new_version
-    WHERE id = p_aggregate_id;
+    /// Apply upcaster chain from stored version to current version.
+    pub fn upcast(
+        &self, domain: &str, entity: &str, action: &str,
+        payload: JsonValue, from_version: i16, to_version: i16,
+    ) -> Result<JsonValue> {
+        let mut current = payload;
+        for v in from_version..to_version {
+            let key = (domain.into(), entity.into(), action.into(), v);
+            let upcaster = self.registry
+                .get(&key)
+                .ok_or_else(|| DomainError::MissingUpcaster {
+                    domain: domain.into(), entity: entity.into(),
+                    action: action.into(), from: v, to: v + 1,
+                })?;
+            current = upcaster(current);
+        }
+        Ok(current)
+    }
+}
 
-    RETURN v_new_version;
-END;
-$$ LANGUAGE plpgsql;
+// Example upcasters — pure functions:
+fn product_created_v1_to_v2(mut payload: JsonValue) -> JsonValue {
+    payload["currency"] = json!("USD");
+    payload
+}
+
+fn product_created_v2_to_v3(mut payload: JsonValue) -> JsonValue {
+    payload["tax_rate"] = json!(0);
+    payload
+}
 ```
 
-**Gapless ordering**: The `global_position_counter` is incremented in the same transaction as event insertion, guaranteeing no gaps. This serializes all writes through a single counter row -- acceptable at <10K events/sec. At higher throughput, switch to `BIGSERIAL` + gap-aware polling with a trailing delay.
+### Upcasting Strategies
+
+| Strategy               | When Applied              | Storage Cost        | CPU Cost      | Data Safety        |
+| ---------------------- | ------------------------- | ------------------- | ------------- | ------------------ |
+| **Lazy (on-read)**     | Every stream load         | None                | Per-read      | Original preserved |
+| **Lazy-with-cache**    | First read, then snapshot | Snapshot storage    | One-time      | Original preserved |
+| **Eager (batch)**      | Background migration job  | Rewritten events    | One-time bulk | Risk if in-place   |
+| **Copy-and-transform** | New stream created        | 2x during migration | One-time bulk | Original preserved |
+
+**Default choice: Lazy** — combined with snapshots, the upcaster chain only processes events since last snapshot.
 
 ---
 
-## 5.9 Aggregate Lifecycle (State Machine)
+## 8. Aggregate Design (Pure Domain, Zero Dependencies)
 
-Every aggregate type follows a state machine. Events drive transitions. Invalid transitions are rejected at the domain layer.
+### State Machine (Technology-Free)
 
 ```mermaid
 stateDiagram-v2
@@ -1007,334 +1160,675 @@ stateDiagram-v2
     Cancelled --> [*]
 ```
 
-The state machine is enforced in domain code (not in Postgres). The aggregate's `apply(event)` method transitions state. Commands validate against current state before producing events.
+### Decider Pattern (Pure Functions)
 
----
+The core aggregate logic is three pure functions — no async, no I/O, no framework:
 
-## 5.10 Projection Types
-
-Three strategies for building read models from events:
-
-```mermaid
-flowchart TD
-    subgraph Inline["Inline (Synchronous)"]
-        I1["Command Handler"] --> I2["Append Event"]
-        I2 --> I3["Update Read Model"]
-        I3 --> I4["Return Response"]
-        I_NOTE["Same transaction\nStrong consistency\nAdds write latency"]
-    end
-
-    subgraph Async["Async (Eventually Consistent)"]
-        A1["Command Handler"] --> A2["Append Event"]
-        A2 --> A3["Return Response"]
-        A4["Projection Worker"] -.->|"polls"| A2
-        A4 --> A5["Update Read Model"]
-        A_NOTE["Separate process\nEventual consistency\nDecoupled from writes"]
-    end
-
-    subgraph Live["Live (On-Demand)"]
-        L1["Query Handler"] --> L2["Load Event Stream"]
-        L2 --> L3["Replay & Fold"]
-        L3 --> L4["Return Computed View"]
-        L_NOTE["No stored state\nAlways current\nOnly for short streams"]
-    end
+```
+Pseudocode (for readability):
+  decide:        (command, state) → events     — business rule validation
+  evolve:        (state, event)  → state       — pure state transition
+  initial_state: ()              → state       — starting point
 ```
 
-| Type   | Consistency | Write Latency | Read Latency | Use Case                              |
-| ------ | ----------- | ------------- | ------------ | ------------------------------------- |
-| Inline | Strong      | Higher        | O(1) lookup  | Uniqueness checks, critical counts    |
-| Async  | Eventual    | None added    | O(1) lookup  | Most read models, dashboards, lists   |
-| Live   | Strong      | None          | O(n) replay  | Short streams, debugging, admin views |
+### Rust Implementation: Typestate Enforcement
 
-**Default choice: Async** with inline only for invariant enforcement (e.g., unique email check).
+```rust
+// domain/aggregate.rs — Compile-time state machine via typestate pattern
 
-### Domain-Scoped Projection Routing
+// Marker types — zero-size, exist only for the type system
+pub struct Draft;
+pub struct Active;
+pub struct Suspended;
+pub struct Completed;
+pub struct Cancelled;
 
-Projection workers subscribe by domain prefix, enforcing SoC at the infrastructure level:
+// Aggregate parameterized by state marker
+pub struct Order<S> {
+    id: Uuid,
+    tenant_id: Uuid,
+    version: i32,
+    data: serde_json::Value,
+    _state: std::marker::PhantomData<S>,
+}
 
-```mermaid
-flowchart TD
-    ES["Event Store"]
+// Only Draft orders can be confirmed — compile error otherwise
+impl Order<Draft> {
+    pub fn confirm(self) -> (Order<Active>, Vec<EventEnvelope>) {
+        // Returns new typed state + events to append
+    }
+    pub fn cancel(self, reason: &str) -> (Order<Cancelled>, Vec<EventEnvelope>) { ... }
+}
 
-    ES -->|"WHERE domain = 'commerce'"| PW_C["Commerce Worker\n---\nBuilds: product views,\norder views, cart views"]
-    ES -->|"WHERE domain = 'billing'"| PW_B["Billing Worker\n---\nBuilds: invoice views,\nsubscription views"]
-    ES -->|"WHERE domain = 'iam'"| PW_I["IAM Worker\n---\nBuilds: user profiles,\nrole views"]
-    ES -->|"WHERE domain = 'content'"| PW_D["Content Worker\n---\nBuilds: document views,\nmedia views"]
+// Only Active orders can be suspended/completed/cancelled
+impl Order<Active> {
+    pub fn suspend(self, reason: &str) -> (Order<Suspended>, Vec<EventEnvelope>) { ... }
+    pub fn complete(self) -> (Order<Completed>, Vec<EventEnvelope>) { ... }
+    pub fn cancel(self, reason: &str) -> (Order<Cancelled>, Vec<EventEnvelope>) { ... }
+}
 
-    PW_C --> RM["Read Model DB"]
-    PW_B --> RM
-    PW_I --> RM
-    PW_D --> RM
-```
-
-**Query pattern** for domain-scoped polling:
-
-```sql
--- Each worker only consumes events from its domain
--- Uses global_position (NOT created_at) for correct ordering
-SELECT * FROM events
-WHERE domain = $1                -- e.g. 'commerce'
-  AND global_position > $2       -- checkpoint position (from projection_checkpoints.last_position)
-ORDER BY global_position ASC
-LIMIT $3;                        -- batch size
-```
-
-**Cross-domain projections** (e.g., an order view that includes customer name from `iam.user`) subscribe to multiple domains:
-
-```sql
--- Cross-domain worker subscribes to specific types across domains
-SELECT * FROM events
-WHERE aggregate_type IN ('commerce.order', 'iam.user')
-  AND global_position > $1
-ORDER BY global_position ASC
-LIMIT $2;
-```
-
-Each worker maintains its own checkpoint in `projection_checkpoints` with its `domain` column set, enabling independent scaling and restarting per domain.
-
----
-
-## 5.11 Industry Validation
-
-This architecture follows patterns proven at scale:
-
-| Platform            | Pattern                          | How                                                                                                                            |
-| ------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
-| **Salesforce**      | Schemaless entities via metadata | Universal Data Dictionary (UDD) - fields stored in generic columns, schema defined as metadata rows. No DDL for custom fields. |
-| **Marten (.NET)**   | JSONB event store in Postgres    | `mt_events` table with JSONB `data` column. Async daemon for projections. Upcasting via registered transformations.            |
-| **Eventide (Ruby)** | PL/pgSQL append function         | `write_message` function handles optimistic concurrency. Messages stored as JSONB.                                             |
-| **Shopify**         | Hybrid relational + JSONB        | Core tables for commerce, `metafields` (typed JSONB key-value) for extensibility.                                              |
-| **Zitadel**         | Event-sourced IAM                | Full audit trail, time-travel queries, CQRS projections for read-optimized views.                                              |
-
-**Key benchmark**: JSONB with GIN indexes is **15,000x faster** than EAV (Entity-Attribute-Value) joins for dynamic attribute queries, and the database is ~3x smaller (source: coussej.github.io benchmarks).
-
----
-
-## 6. Schema Evolution Strategy
-
-### 6.1 Payload Versioning
-
-Every event has its schema version as a **promoted column** (not embedded in payload). The payload contains only business data:
-
-```json
--- schema_version = 2 (stored as SMALLINT column on events table)
--- payload:
-{
-  "name": "Widget Pro",
-  "price": 2999,
-  "currency": "USD"
+// Only Suspended orders can be reactivated
+impl Order<Suspended> {
+    pub fn reactivate(self) -> (Order<Active>, Vec<EventEnvelope>) { ... }
+    pub fn cancel(self, reason: &str) -> (Order<Cancelled>, Vec<EventEnvelope>) { ... }
 }
 ```
 
-This promotion enables queries like `SELECT * FROM events WHERE event_type = 'commerce.product.created' AND schema_version < 3` for background migration workers, without JSONB parsing.
+> **Key advantage**: Invalid state transitions (e.g. confirming a cancelled order) are caught at **compile time**, not runtime.
 
-### 6.2 Upcaster Pipeline
+---
 
-When loading events, an upcaster chain transforms old payloads to current format:
-
-```mermaid
-flowchart LR
-    RAW["Raw Event\nschema_version: 1"] --> U1["Upcaster v1->v2\nadd currency='USD'"]
-    U1 --> U2["Upcaster v2->v3\nadd tax_rate=0"]
-    U2 --> CURRENT["Current Format\nschema_version: 3"]
-```
-
-**Rules**:
-
-- Upcasters are pure functions: `(old_payload) -> new_payload`
-- They run lazily at read time (no rewriting events)
-- Each upcaster handles exactly one version increment
-- Upcasters compose: `v1 -> v2 -> v3 -> ... -> current`
-- Old events are NEVER mutated in the store
-
-### 6.3 Upcasting Strategies
-
-| Strategy               | When Applied             | Storage Cost        | CPU Cost      | Data Safety        |
-| ---------------------- | ------------------------ | ------------------- | ------------- | ------------------ |
-| **Lazy (on-read)**     | Every stream load        | None                | Per-read      | Original preserved |
-| **Lazy-with-cache**    | First read, then cached  | Snapshot storage    | One-time      | Original preserved |
-| **Eager (batch)**      | Background migration job | Rewritten events    | One-time bulk | Risk if in-place   |
-| **Copy-and-transform** | New stream created       | 2x during migration | One-time bulk | Original preserved |
-
-**Default choice: Lazy** -- upcasters run at read time. Combined with snapshots, the upcaster chain only processes events since last snapshot.
-
-### 6.4 Breaking Changes (Two-Phase Deployment)
-
-For changes that cannot be handled by additive upcasting:
-
-```mermaid
-flowchart LR
-    subgraph Phase1["Phase 1: Deploy v(N+1)"]
-        P1["Supports BOTH old and new schema"]
-        P1 --> P2["Writes new schema_version"]
-        P2 --> P3["Reads handle both versions"]
-    end
-
-    subgraph Phase2["Phase 2: Deploy v(N+2)"]
-        P4["Removes old schema support"]
-        P4 --> P5["Only new schema_version"]
-    end
-
-    Phase1 -->|"wait for in-flight\naggregates to drain"| Phase2
-```
-
-No event rewriting needed. Forward compatibility is maintained by temporal overlap.
-
-### 6.5 When to Add a New Entity Type
-
-No migration needed. Just:
-
-1. Define aggregate behavior in code (command handler + event handlers)
-2. Define projection logic for the read model
-3. Start emitting events with `aggregate_type = 'new_entity'`
-
-The `aggregates`, `events`, and `read_entities` tables handle it without DDL changes.
-
-### 6.6 Migration Comparison
+## 9. Hexagonal Architecture (Complete Wiring)
 
 ```mermaid
 flowchart TD
-    subgraph Traditional["Traditional Schema Change"]
-        T1["Write ALTER TABLE migration"] --> T2["Test migration on staging"]
-        T2 --> T3["Schedule maintenance window"]
-        T3 --> T4["Run migration in production"]
-        T4 --> T5["Update application code"]
-        T5 --> T6["Deploy application"]
-        T6 --> T7["Rollback plan if failure"]
+    subgraph Transport["Transport Adapters (I/O boundary)"]
+        HTTP["HTTP/REST Adapter\n(axum)"]
+        GRPC["gRPC Adapter\n(tonic)"]
+        CLI["CLI Adapter"]
+        WEBHOOK["Webhook Adapter"]
     end
 
-    subgraph EventDriven["Event-Driven Schema Change"]
-        E1["Bump schema_version in code"] --> E2["Add upcaster function"]
-        E2 --> E3["Update projection logic"]
-        E3 --> E4["Deploy application"]
-        E4 --> E5["Optional: rebuild projections"]
+    subgraph Application["Application Layer (orchestration)"]
+        CH["Command Handlers"]
+        QH["Query Handlers"]
+        PW["Projection Workers"]
+        PM["Process Managers"]
+        OR["Outbox Relay"]
+        ACL["Anti-Corruption Layer"]
     end
+
+    subgraph Domain["Domain Core (zero deps)"]
+        AGG["Aggregates\n(pure state machines)"]
+        EVT["Domain Events\n(immutable value objects)"]
+        PORTS["Port Traits"]
+        VO["Value Objects\n(Money, EntityId, Version)"]
+        ERR["Error Codes\n(i18n-ready)"]
+        UPC["Upcasters\n(pure functions)"]
+    end
+
+    subgraph Infrastructure["Infrastructure Adapters"]
+        direction LR
+        subgraph Storage["Storage Adapters"]
+            PG_ES["Postgres\nEvent Store"]
+            PG_RM["Postgres\nRead Model"]
+            PG_REL["Postgres\nRelations"]
+        end
+        subgraph External["External Service Adapters"]
+            AUTH["OIDC Adapter\n(Zitadel/Keycloak)"]
+            PAY["Payment Adapter\n(Stripe/PayPal)"]
+            CACHE["Cache Adapter\n(Redis)"]
+        end
+    end
+
+    Transport --> CH
+    Transport --> QH
+    CH --> AGG
+    CH --> PORTS
+    QH --> PORTS
+    PW --> PORTS
+    PM --> PORTS
+    ACL --> PORTS
+
+    AGG --> EVT
+    AGG --> VO
+    AGG --> ERR
+
+    PORTS -.->|"implemented by"| Storage
+    PORTS -.->|"implemented by"| External
+```
+
+### Composition Root
+
+```rust
+// main.rs — The ONLY place that knows about concrete implementations.
+
+#[tokio::main]
+async fn main() {
+    let config = Config::from_env();
+    let pool = PgPool::connect(&config.database_url).await.unwrap();
+
+    // Concrete adapters, injected as trait objects
+    let event_store: Arc<dyn EventStore> = Arc::new(PgEventStore::new(pool.clone()));
+    let read_model: Arc<dyn ReadModelStore> = Arc::new(PgReadModelStore::new(pool.clone()));
+    let relations: Arc<dyn RelationStore> = Arc::new(PgRelationStore::new(pool.clone()));
+    let identity: Arc<dyn IdentityProvider> = Arc::new(ZitadelAdapter::new(&config.oidc));
+    let cache: Arc<dyn Cache> = Arc::new(RedisAdapter::new(&config.redis_url));
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(PgCheckpointStore::new(pool.clone()));
+
+    // Application wiring — only trait objects, never concrete types
+    let command_bus = CommandBus::new(event_store.clone(), identity.clone());
+    let query_bus = QueryBus::new(read_model.clone(), cache.clone());
+
+    // Start projection workers and HTTP server
+    tokio::spawn(projection_worker(
+        event_store.clone(), read_model.clone(), checkpoints.clone(),
+    ));
+    serve_http(command_bus, query_bus).await;
+}
 ```
 
 ---
 
-## 7. Deployment Architecture
+## 10. Storage Abstraction (How Postgres Details Hide Behind Ports)
 
-### 7.1 Small Scale
+The original design has extensive Postgres-specific SQL. Here's how each feature maps to the abstract port:
+
+| Postgres-Specific Feature              | Abstract Port Capability                             | What the Adapter Hides                               |
+| -------------------------------------- | ---------------------------------------------------- | ---------------------------------------------------- |
+| `PL/pgSQL append_events()` function    | `EventStore::append()`                               | Atomic append with gapless position counter          |
+| `UNIQUE(aggregate_id, version)`        | `EventStore::append()` returns `ConcurrencyConflict` | How concurrency is enforced                          |
+| `JSONB` column + `GIN jsonb_path_ops`  | `ReadModelStore::query(filters)`                     | How document queries are indexed                     |
+| `text_pattern_ops` index               | No longer needed — SOC columns use equality matches  | How prefix matching is optimized (eliminated by SOC) |
+| `RLS` policies via `SET app.tenant_id` | `TenantIsolation::set_tenant_context()`              | How tenant data is isolated                          |
+| `LISTEN/NOTIFY` trigger                | `EventNotifier::notify()` / `::subscribe()`          | How event availability is signaled                   |
+| `global_position_counter` singleton    | `EventStore::append()` returns position              | How monotonic ordering is achieved                   |
+| `BIGINT global_position`               | `StoredEvent.global_position: i64`                   | Storage type of the position                         |
+| Table partitioning (hash/range)        | Transparent to port consumers                        | How data is physically organized                     |
+
+### Adapter Example (Hidden from Domain)
+
+```rust
+// adapters/postgres/event_store.rs — Postgres-specific, implements EventStore trait
+
+pub struct PgEventStore {
+    pool: PgPool,
+}
+
+#[async_trait]
+impl EventStore for PgEventStore {
+    async fn append(
+        &self, tenant_id: Uuid, stream_id: Uuid,
+        stream_domain: &str, stream_entity: &str,
+        expected_version: i32, events: &[EventEnvelope],
+    ) -> Result<i32> {
+        // Calls PL/pgSQL append_events() function internally.
+        // Domain layer never sees this SQL.
+        // SOC: domain and entity are separate columns in the DB.
+        let events_json = serde_json::to_value(events)?;
+        let new_version: i32 = sqlx::query_scalar(
+            "SELECT append_events($1, $2, $3, $4, $5, $6)"
+        )
+        .bind(tenant_id).bind(stream_id).bind(stream_domain)
+        .bind(stream_entity).bind(expected_version).bind(events_json)
+        .fetch_one(&self.pool).await
+        .map_err(|e| match e { /* map constraint violation to ConcurrencyConflict */ })?;
+        Ok(new_version)
+    }
+
+    async fn poll_by_domain(
+        &self, domain: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>> {
+        // Equality match on stream_domain — no text_pattern_ops needed.
+        let rows = sqlx::query_as::<_, StoredEventRow>(
+            "SELECT * FROM events WHERE stream_domain = $1 AND global_position > $2
+             ORDER BY global_position ASC LIMIT $3"
+        )
+        .bind(domain).bind(after_position).bind(limit)
+        .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    async fn poll_by_entity(
+        &self, domain: &str, entity: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>> {
+        let rows = sqlx::query_as::<_, StoredEventRow>(
+            "SELECT * FROM events WHERE stream_domain = $1 AND stream_entity = $2
+             AND global_position > $3 ORDER BY global_position ASC LIMIT $4"
+        )
+        .bind(domain).bind(entity).bind(after_position).bind(limit)
+        .fetch_all(&self.pool).await?;
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+}
+```
+
+---
+
+## 10.1 Storage Column Design — Separation of Concerns
+
+### The Problem with Composite Type Strings
+
+Storing `event_type = "commerce.product.created"` as a single string conflates three independent concerns:
+
+1. **Domain** — which bounded context owns this event
+2. **Entity** — which aggregate type produced it
+3. **Action** — what happened
+
+If "commerce" is renamed to "shop", every row in the event store must be rewritten — or the code must maintain a growing list of aliases. The same applies if an entity is renamed (`product` → `listing`). This violates SOC: one rename forces changes across unrelated responsibilities.
+
+### Industry Approaches Compared
+
+| System                    | Stream/Category Naming         | Type Columns                                | Rename Strategy                                                          |
+| ------------------------- | ------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------ |
+| **Marten**                | `stream_id` (string)           | `type` (alias) + `mt_dotnet_type` (CLR FQN) | `Events.MapEventType<T>("alias")` — decouples stored name from code type |
+| **Eventide / Message DB** | `{category}-{id}` stream       | Type embedded in message body               | `category` parsed from stream_id via `get_category()` function           |
+| **EventStoreDB**          | `{type}-{id}` stream           | `eventType` on each event                   | Event migration: emit to new streams. No in-place rename                 |
+| **SoftwareMill**          | `stream_id` only               | None — type lives inside JSON payload       | No rename problem (payload is opaque)                                    |
+| **Kspeakman (Postgres)**  | Stream table has `Type` column | Event table has separate `Type` column      | Stream type ≠ event type — explicitly separated                          |
+| **Axon Framework**        | Aggregate type + identifier    | `payloadType` on events                     | `EventUpcaster` chain transforms types during deserialization            |
+
+### Key Insight: Stream Type ≠ Event Type
+
+Kspeakman's design makes this explicit: the **stream** (aggregate) has a type ("Order"), and each **event** in that stream has its own type ("OrderPlaced", "OrderShipped"). These are different concepts with different lifecycles:
+
+- Stream type changes when you restructure aggregates (rare)
+- Event type changes when you rename domain actions (never — events are immutable facts)
+- Domain changes when you reorganize bounded contexts (very rare)
+
+### SOC Column Design (Recommended)
+
+Split the composite namespace into **independent, single-responsibility columns**:
+
+```
+EVENT TABLE (abstract schema)
+─────────────────────────────────────────────────────
+Column              Responsibility          Example Value
+─────────────────────────────────────────────────────
+id                  Identity                uuid
+global_position     Ordering                8042
+tenant_id           Isolation               uuid
+
+stream_domain       Bounded context owner   "commerce"
+stream_entity       Aggregate type          "product"
+stream_id           Aggregate instance      uuid
+stream_version      Optimistic concurrency  3
+
+event_action        What happened           "created"
+event_version       Payload schema version  2
+payload             Business data           { ... }
+metadata            Operational baggage     { ... }
+
+correlation_id      Request tracing         uuid | null
+causation_id        Causal chain            uuid | null
+user_id             Actor                   uuid | null
+created_at          Audit timestamp         utc datetime
+─────────────────────────────────────────────────────
+```
+
+**Why this works**:
+
+| SOC Benefit                  | How                                                                    |
+| ---------------------------- | ---------------------------------------------------------------------- |
+| **Rename domain**            | Update `stream_domain` column via type map — no payload changes        |
+| **Rename entity**            | Update `stream_entity` via type map — events and actions unchanged     |
+| **Rename action**            | Never needed — events are immutable historical facts                   |
+| **Projection routing**       | `WHERE stream_domain = 'commerce'` — no prefix parsing                 |
+| **Cross-entity queries**     | `WHERE stream_entity = 'product'` — no string splitting                |
+| **Index efficiency**         | Equality on short columns instead of `LIKE 'commerce.%'`               |
+| **Composite reconstruction** | `format!("{}.{}.{}", domain, entity, action)` when needed at app layer |
+
+### Type Alias Registry (Rename Safety)
+
+Events are immutable facts — you never rewrite them. But code types evolve. A **type alias registry** provides indirection between stored identifiers and runtime types:
+
+```rust
+// ─── Type Mapping Port ──────────────────────────────────────────
+
+/// Resolves stored type identifiers ↔ runtime type names.
+/// Handles renames without rewriting event history.
+#[async_trait]
+pub trait TypeRegistry: Send + Sync {
+    /// Given a stored (domain, entity, action), resolve to current runtime type name.
+    /// Returns None if no alias mapping exists (identity mapping assumed).
+    fn resolve_event_type(
+        &self,
+        stored_domain: &str,
+        stored_entity: &str,
+        stored_action: &str,
+    ) -> Option<ResolvedType>;
+
+    /// Given a stored (domain, entity), resolve to current aggregate type name.
+    fn resolve_aggregate_type(
+        &self,
+        stored_domain: &str,
+        stored_entity: &str,
+    ) -> Option<ResolvedAggregate>;
+
+    /// Register an alias: old stored name → current runtime name.
+    fn register_event_alias(
+        &mut self,
+        old_domain: &str, old_entity: &str, old_action: &str,
+        new_domain: &str, new_entity: &str, new_action: &str,
+    );
+
+    fn register_domain_alias(&mut self, old_domain: &str, new_domain: &str);
+    fn register_entity_alias(&mut self, old_domain: &str, old_entity: &str, new_entity: &str);
+}
+
+pub struct ResolvedType {
+    pub domain: String,
+    pub entity: String,
+    pub action: String,
+}
+
+pub struct ResolvedAggregate {
+    pub domain: String,
+    pub entity: String,
+}
+```
+
+```rust
+// ─── In-Memory Implementation (composition root) ───────────────
+
+pub struct InMemoryTypeRegistry {
+    domain_aliases: HashMap<String, String>,                       // "commerce" → "shop"
+    entity_aliases: HashMap<(String, String), String>,             // ("commerce","product") → "listing"
+    event_aliases: HashMap<(String, String, String), (String, String, String)>,
+}
+
+impl InMemoryTypeRegistry {
+    pub fn new() -> Self {
+        let mut reg = Self::default();
+        // Register historical renames:
+        reg.register_domain_alias("commerce", "shop");
+        reg.register_entity_alias("shop", "product", "listing");
+        reg
+    }
+}
+```
+
+**How rename flows work**:
+
+```
+1. Domain "commerce" renamed to "shop"
+   ─────────────────────────────────────
+   Old events:  stream_domain="commerce", stream_entity="product", event_action="created"
+   TypeRegistry: resolve("commerce", "product", "created") → ("shop", "listing", "created")
+
+   New events:  stream_domain="shop", stream_entity="listing", event_action="created"
+   TypeRegistry: resolve("shop", "listing", "created") → identity (no alias)
+
+   Projection query: uses TypeRegistry to accept BOTH old and new names.
+   No event rewriting. No migration. Zero downtime.
+
+2. Projection workers use resolved types for routing:
+   ─────────────────────────────────────
+   Worker subscribes to domain="shop"
+   → TypeRegistry tells it to ALSO poll domain="commerce" (old alias)
+   → Both old and new events are processed correctly
+```
+
+### Updated StoredEvent and EventEnvelope
+
+With SOC columns, the Rust value objects become:
+
+```rust
+pub struct EventEnvelope {
+    pub event_action: String,         // "created" (just the action, not fully qualified)
+    pub schema_version: i16,
+    pub payload: JsonValue,
+    pub metadata: JsonValue,
+    pub correlation_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+}
+
+pub struct StoredEvent {
+    pub id: Uuid,
+    pub global_position: i64,
+    pub tenant_id: Uuid,
+    pub stream_domain: String,        // "commerce"
+    pub stream_entity: String,        // "product"
+    pub stream_id: Uuid,              // aggregate instance
+    pub stream_version: i32,
+    pub event_action: String,         // "created"
+    pub event_version: i16,           // schema version for upcaster dispatch
+    pub payload: JsonValue,
+    pub metadata: JsonValue,
+    pub correlation_id: Option<Uuid>,
+    pub causation_id: Option<Uuid>,
+    pub user_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl StoredEvent {
+    /// Reconstruct the fully-qualified event type for display/logging.
+    pub fn qualified_event_type(&self) -> String {
+        format!("{}.{}.{}", self.stream_domain, self.stream_entity, self.event_action)
+    }
+
+    /// Reconstruct the aggregate type.
+    pub fn qualified_aggregate_type(&self) -> String {
+        format!("{}.{}", self.stream_domain, self.stream_entity)
+    }
+}
+```
+
+### Updated EventStore Trait (SOC-Aware)
+
+```rust
+#[async_trait]
+pub trait EventStore: Send + Sync {
+    async fn append(
+        &self,
+        tenant_id: Uuid,
+        stream_id: Uuid,
+        stream_domain: &str,
+        stream_entity: &str,
+        expected_version: i32,
+        events: &[EventEnvelope],
+    ) -> Result<i32>;
+
+    async fn load_stream(
+        &self, tenant_id: Uuid, stream_id: Uuid,
+    ) -> Result<Vec<StoredEvent>>;
+
+    async fn load_stream_from(
+        &self, tenant_id: Uuid, stream_id: Uuid, from_version: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll all events across all domains (global subscription).
+    async fn poll_global(
+        &self, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll by bounded context — equality match, no prefix parsing.
+    async fn poll_by_domain(
+        &self, domain: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll by entity type within a domain.
+    async fn poll_by_entity(
+        &self, domain: &str, entity: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+
+    /// Poll by specific event action across all entities.
+    async fn poll_by_action(
+        &self, action: &str, after_position: i64, limit: i32,
+    ) -> Result<Vec<StoredEvent>>;
+}
+```
+
+### Indexing Strategy (Adapter Concern)
+
+The SOC column design enables efficient indexes without `text_pattern_ops` hacks:
+
+```
+Adapter-level indexes (hidden behind EventStore trait):
+─────────────────────────────────────────────────────
+(tenant_id, stream_id, stream_version)  — unique, concurrency control
+(tenant_id, stream_domain, global_position)  — domain subscription polling
+(tenant_id, stream_domain, stream_entity, global_position)  — entity-level polling
+(global_position)  — global catch-up subscription
+```
+
+Equality matches on short string columns (`stream_domain = 'commerce'`) outperform prefix matching (`aggregate_type LIKE 'commerce.%'`) on every storage engine.
+
+---
+
+## 11. Production Readiness (Abstract Patterns)
+
+### 11.1 GDPR Compliance: Crypto-Shredding
+
+```mermaid
+sequenceDiagram
+    participant DPO as Data Protection Officer
+    participant API as Erasure Endpoint
+    participant EKS as EncryptionKeyStore port
+    participant PW as Projection Workers
+    participant RM as ReadModelStore port
+
+    DPO->>API: DELETE /subjects/{user_id}/data
+    API->>EKS: destroy_key(subject_id)
+    Note over EKS: Key destroyed — encrypted fields<br/>in event store are permanently unreadable
+    API->>PW: Trigger re-projection for affected aggregates
+    PW->>RM: Rebuild read models (encrypted → "[REDACTED]")
+    API-->>DPO: 202 Accepted
+```
+
+The `EncryptionKeyStore` trait abstracts over where keys are stored (Postgres, Vault, HSM, KMS). The domain only knows: create keys, get keys, destroy keys.
+
+### 11.2 Dead Letter Queue (Abstract Flow)
 
 ```mermaid
 flowchart TD
-    LB["Load Balancer"] --> APP["Application\n(API + Command + Query)"]
-    APP --> PG_WRITE["Postgres\n(Event Store + Read Model)"]
-    APP --> REDIS["Redis\n(Cache + Rate Limit)"]
-    APP --> IAM["Zitadel / Keycloak"]
-
-    PW["Projection Worker"] --> PG_WRITE
+    EVT["Event arrives at projection handler"]
+    EVT --> TRY["Try processing"]
+    TRY -->|Success| NEXT["Advance checkpoint via CheckpointStore port"]
+    TRY -->|Failure| RETRY{"retry_count < max?"}
+    RETRY -->|Yes| BACKOFF["Exponential backoff: base × 2^count"]
+    BACKOFF --> TRY
+    RETRY -->|No| DLQ["DeadLetterStore::record_failure()"]
+    DLQ --> SKIP["Skip event, advance checkpoint"]
+    SKIP --> ALERT["Emit alert metric"]
 ```
 
-### 7.2 Production Scale
+### 11.3 Process Manager / Saga
+
+```mermaid
+stateDiagram-v2
+    [*] --> AwaitingPayment : order.placed
+    AwaitingPayment --> AwaitingInventory : payment.charged
+    AwaitingPayment --> Cancelled : payment.failed → compensate
+    AwaitingInventory --> AwaitingShipment : inventory.reserved
+    AwaitingInventory --> RefundingPayment : inventory.insufficient → compensate
+    RefundingPayment --> Cancelled : payment.refunded
+    AwaitingShipment --> Completed : shipment.dispatched
+    Completed --> [*]
+    Cancelled --> [*]
+```
+
+Coordination uses `ProcessManagerStore` trait. The trait abstracts whether process state lives in Postgres, DynamoDB, or Redis.
+
+### 11.4 Domain vs Integration Events
+
+| Aspect           | Domain Event                          | Integration Event                          |
+| ---------------- | ------------------------------------- | ------------------------------------------ |
+| Scope            | Within bounded context                | Crosses boundaries                         |
+| Storage          | EventStore trait (immutable, forever) | OutboxPublisher trait (ephemeral, relayed) |
+| Schema ownership | Internal, can change freely           | Public contract, must be versioned         |
+| Payload          | Rich, includes internal IDs           | Lean, public-facing identifiers only       |
+
+The `OutboxPublisher` trait + Anti-Corruption Layer pattern abstracts the boundary between internal and external events.
+
+### 11.5 Event Notification (Abstract)
 
 ```mermaid
 flowchart TD
-    LB["Load Balancer"] --> API1["API Instance 1"]
-    LB --> API2["API Instance 2"]
-    LB --> API3["API Instance N"]
+    subgraph Writer["Write Path"]
+        APP["EventStore::append()"] --> NOTIFY["EventNotifier::notify(position)"]
+    end
 
-    API1 --> PG_WRITE["Postgres Primary\n(Event Store)"]
-    API2 --> PG_WRITE
-    API3 --> PG_WRITE
+    subgraph Consumer["Projection Worker"]
+        SUBSCRIBE["EventNotifier::subscribe()"]
+        POLL["Poll loop (fallback interval)"]
 
-    PG_WRITE -->|"streaming replication"| PG_READ["Postgres Replica\n(Read Model)"]
+        SUBSCRIBE -->|"notification"| WAKE["Wake immediately"]
+        POLL -->|"interval elapsed"| WAKE
+        WAKE --> FETCH["EventStore::poll_by_domain(domain, checkpoint, batch)"]
+        FETCH --> PROCESS["Process batch"]
+        PROCESS --> CHECKPOINT["CheckpointStore::save_position()"]
+        CHECKPOINT --> POLL
+    end
 
-    API1 --> PG_READ
-    API2 --> PG_READ
-    API3 --> PG_READ
-
-    PW1["Projection Worker 1"] --> PG_WRITE
-    PW1 --> PG_READ
-    PW2["Projection Worker 2"] --> PG_WRITE
-    PW2 --> PG_READ
-
-    API1 --> REDIS["Redis Cluster"]
-    API2 --> REDIS
-    API3 --> REDIS
-
-    API1 --> IAM["Zitadel"]
-    API1 --> PAY["Stripe / PayPal"]
+    NOTIFY -.->|"best-effort hint"| SUBSCRIBE
 ```
 
-### 7.3 Large Scale
+**Critical**: `EventNotifier` is a **hint-only optimization**. The projection worker MUST poll regardless. A `NoOpEventNotifier` that does nothing is a valid adapter — the system degrades to polling-only with slightly higher latency.
+
+---
+
+## 12. Deployment Architecture (Abstract)
+
+### Small Scale
+
+```mermaid
+flowchart TD
+    LB["Load Balancer"] --> APP["Application\n(API + Commands + Queries)"]
+    APP --> ES["EventStore adapter"]
+    APP --> RM["ReadModelStore adapter"]
+    APP --> CACHE["Cache adapter"]
+    APP --> AUTH["IdentityProvider adapter"]
+    PW["Projection Worker"] --> ES
+    PW --> RM
+```
+
+### Production Scale
 
 ```mermaid
 flowchart TD
     LB["Load Balancer"]
+    LB --> API1["API Instance 1"]
+    LB --> API2["API Instance 2"]
+    LB --> APIN["API Instance N"]
 
-    subgraph API_POOL["API Pool"]
-        API1["API 1"]
-        API2["API 2"]
-        APIN["API N"]
+    subgraph Write["Write Path (EventStore adapter)"]
+        ES_PRIMARY["Primary"]
+        ES_REPLICA["Replica(s)"]
     end
 
-    subgraph WRITE_CLUSTER["Write Cluster"]
-        PG_ES["Event Store\n(Postgres Primary)"]
-        PG_ES_R1["ES Replica 1"]
-        PG_ES_R2["ES Replica 2"]
+    subgraph Read["Read Path (ReadModelStore adapter)"]
+        RM_PRIMARY["Primary"]
+        RM_REPLICA["Replica(s)"]
     end
 
-    subgraph READ_CLUSTER["Read Cluster"]
-        PG_RM["Read Model Primary"]
-        PG_RM_R1["RM Replica 1"]
-        PG_RM_R2["RM Replica 2"]
+    subgraph Projections["Projection Workers (domain-scoped)"]
+        PW1["commerce.* worker"]
+        PW2["billing.* worker"]
+        PW3["iam.* worker"]
+        PW4["cross-domain worker"]
     end
 
-    subgraph PROJECTION_POOL["Projection Workers (domain-scoped)"]
-        PW1["Commerce Worker\n(commerce.*)"]
-        PW2["Billing Worker\n(billing.*)"]
-        PW3["IAM Worker\n(iam.*)"]
-        PW4["Analytics Worker\n(cross-domain)"]
-    end
+    API1 -->|"writes"| ES_PRIMARY
+    API2 -->|"writes"| ES_PRIMARY
+    APIN -->|"writes"| ES_PRIMARY
+    API1 -->|"reads"| RM_REPLICA
+    API2 -->|"reads"| RM_REPLICA
+    APIN -->|"reads"| RM_REPLICA
 
-    subgraph CACHE["Cache Layer"]
-        RC1["Redis 1"]
-        RC2["Redis 2"]
-        RC3["Redis 3"]
-    end
+    Projections -->|"consume from"| ES_REPLICA
+    Projections -->|"write to"| RM_PRIMARY
 
-    LB --> API_POOL
-    API_POOL -->|"writes"| PG_ES
-    API_POOL -->|"reads"| READ_CLUSTER
-    API_POOL --> CACHE
-
-    PG_ES -->|"replication"| PG_ES_R1
-    PG_ES -->|"replication"| PG_ES_R2
-
-    PROJECTION_POOL -->|"consume events"| WRITE_CLUSTER
-    PROJECTION_POOL -->|"update projections"| PG_RM
-
-    PG_RM -->|"replication"| PG_RM_R1
-    PG_RM -->|"replication"| PG_RM_R2
+    ES_PRIMARY --> ES_REPLICA
+    RM_PRIMARY --> RM_REPLICA
 ```
 
 ---
 
-## 8. Failure Model
+## 13. Failure Model
 
 ```mermaid
 flowchart TD
     subgraph Failures["Failure Scenarios"]
-        F1["Read DB crashes"]
-        F2["Redis crashes"]
-        F3["Projection Worker crashes"]
-        F4["Event Store crashes"]
+        F1["ReadModelStore adapter crashes"]
+        F2["Cache adapter crashes"]
+        F3["Projection worker crashes"]
+        F4["EventStore adapter crashes"]
         F5["Poison event in stream"]
-        F6["Outbox relay crashes"]
+        F6["OutboxPublisher relay crashes"]
         F7["Process manager stuck"]
         F8["Encryption key lost"]
     end
 
-    F1 -->|"Recovery"| R1["Rebuild projections\nfrom event store"]
-    F2 -->|"Recovery"| R2["Warm cache from\nread model DB"]
-    F3 -->|"Recovery"| R3["Restart from last\ncheckpoint position"]
-    F4 -->|"CRITICAL"| R4["System unavailable\nOnly irrecoverable dep"]
-    F5 -->|"Recovery"| R5["Dead letter queue:\nskip + alert + replay after fix"]
-    F6 -->|"Recovery"| R6["Restart relay:\nresumes from last published_at"]
-    F7 -->|"Recovery"| R7["Timeout detector:\nalert + manual compensation"]
-    F8 -->|"CRITICAL"| R8["Active user data\npermanently unreadable"]
+    F1 -->|"Recovery"| R1["Rebuild projections\nfrom EventStore"]
+    F2 -->|"Recovery"| R2["Warm cache from\nReadModelStore"]
+    F3 -->|"Recovery"| R3["Restart from last\nCheckpointStore position"]
+    F4 -->|"CRITICAL"| R4["System unavailable\nonly irrecoverable dependency"]
+    F5 -->|"Recovery"| R5["DeadLetterStore:\nskip + alert + retry after fix"]
+    F6 -->|"Recovery"| R6["Restart relay:\nresumes from last published marker"]
+    F7 -->|"Recovery"| R7["ProcessManagerStore timeout scan:\nalert + manual compensation"]
+    F8 -->|"CRITICAL"| R8["Affected subject's PII\npermanently unreadable"]
 
     style F4 fill:#ff6b6b
     style R4 fill:#ff6b6b
@@ -1344,785 +1838,170 @@ flowchart TD
 
 ---
 
-## 9. Complexity Analysis
+## 14. Complexity Analysis
 
-| Operation                    | Data Structure                    | Time Complexity | Notes                      |
-| ---------------------------- | --------------------------------- | --------------- | -------------------------- |
-| Append event                 | B-tree index on (agg_id, version) | O(log n)        | n = events in stream       |
-| Load aggregate stream        | B-tree index scan                 | O(log n + k)    | k = events to read         |
-| Load from snapshot           | B-tree PK lookup + stream scan    | O(1) + O(k')    | k' = events since snapshot |
-| Rebuild projection           | Full table scan + insert          | O(N)            | N = total events           |
-| Query read model (by type)   | B-tree index + GIN                | O(log n + k)    | k = result set             |
-| JSONB field lookup           | GIN index                         | O(log n)        | via jsonb_path_ops         |
-| Optimistic concurrency check | UNIQUE constraint check           | O(log n)        | n = events per aggregate   |
-| Snapshot creation            | Single insert                     | O(1)            | amortized over N events    |
-
----
-
-## 10. Language Recommendation
-
-```
-RECOMMENDATION
-==============
-Approach: Event-sourced CQRS with generic JSONB entities
-Language: Rust (primary) or Go (alternative)
-Core abstractions:
-  - EventStore trait/interface
-  - AggregateRoot trait/interface
-  - Projection trait/interface
-  - ReadModelStore trait/interface
-  - RelationStore trait/interface (entity graph edges)
-  - IdentityProvider trait/interface
-  - PaymentGateway trait/interface
-  - Translator trait/interface (i18n)
-  - CachePort trait/interface
-  - EncryptionKeyStore trait/interface (GDPR crypto-shredding)
-  - DeadLetterStore trait/interface (failed event handling)
-  - ProcessManagerStore trait/interface (saga coordination)
-  - OutboxPublisher trait/interface (integration event relay)
-External deps:
-  - sqlx or pgx (DB driver)
-  - axum or net/http (HTTP)
-  - serde or encoding/json (serialization)
-  - OIDC client (auth)
-Complexity: O(log n) for all hot paths
-Confidence: HIGH
-
-WHY RUST
-========
-- Typestate pattern enforces valid aggregate state transitions at compile time
-- Zero-cost abstractions: trait dispatch is monomorphized
-- Ownership model prevents data races in concurrent projection workers
-- serde handles JSONB serialization/deserialization with schema_version dispatch
-- sqlx provides compile-time SQL verification
-
-WHY NOT GO (as primary)
-=======================
-- No compile-time enforcement of state machine transitions
-- Less type safety for the upcaster pipeline
-- Still excellent as secondary language for projection workers or CLI tools
-
-IMPLEMENTATION ORDER
-====================
-1. Domain types: Aggregate, Event, ValueObjects (zero deps)
-2. Ports: EventStore, ReadModelStore, RelationStore, IdentityProvider, PaymentGateway, Translator
-3. Event store adapter: Postgres implementation with optimistic concurrency + global_position
-4. Command handlers: business logic operating on aggregates
-5. Projection workers: event consumers building read models + relation graph
-6. Query handlers: read model queries with caching
-7. HTTP adapter: REST API wiring
-8. IAM adapter: Zitadel/Keycloak OIDC
-9. Payment adapter: Stripe/PayPal
-10. Process managers: saga coordination for multi-aggregate workflows
-11. Dead letter queue: failed event handling with retry + backoff
-12. GDPR layer: EncryptionKeyStore + crypto-shredding interceptor
-13. Integration events: OutboxPublisher + relay process + ACL translators
-14. Observability: OpenTelemetry traces + projection lag metrics + alerting
-
-RISKS AND MITIGATIONS
-======================
-Risk: Event store becomes bottleneck under extreme write load
-  -> Mitigation: Partition by tenant_id, use connection pooling
-
-Risk: Projection lag causes stale reads
-  -> Mitigation: Return version in write response, client can poll until projection catches up
-
-Risk: JSONB query performance degrades with large payloads
-  -> Mitigation: GIN indexes with jsonb_path_ops, keep read model payloads denormalized and flat
-
-Risk: Upcaster chain becomes long for old events
-  -> Mitigation: Periodic snapshot creation reduces replay length
-  -> Optional: background worker rewrites old events to current schema (copy, not mutate)
-
-Risk: Schema_version mismatch between writer and reader
-  -> Mitigation: Upcasters are pure functions tested independently, version is explicit in every payload
-```
+| Operation                      | Data Structure (Abstract)                | Time Complexity | Notes                       |
+| ------------------------------ | ---------------------------------------- | --------------- | --------------------------- |
+| Append event                   | Ordered index on (aggregate_id, version) | O(log n)        | n = events in stream        |
+| Load aggregate stream          | Ordered index scan                       | O(log n + k)    | k = events to read          |
+| Load from snapshot             | Point lookup + stream scan               | O(1) + O(k')    | k' = events since snapshot  |
+| Rebuild projection             | Full sequential scan + upsert            | O(N)            | N = total events            |
+| Query read model               | Document index                           | O(log n + k)    | k = result set              |
+| Document field lookup          | Inverted index                           | O(log n)        | adapter-specific index type |
+| Optimistic concurrency check   | Uniqueness constraint check              | O(log n)        | n = events per aggregate    |
+| Relation forward/reverse query | Ordered index scan                       | O(log n + k)    | k = result set              |
 
 ---
 
-## 11. Production Readiness
+## 15. Testing Strategy (Enabled by Abstractions)
 
-### 11.1 GDPR Compliance: Crypto-Shredding
+### Given/When/Then with In-Memory Adapters
 
-Events are immutable -- you cannot `DELETE FROM events WHERE user_id = ?`. GDPR Article 17 (Right to Erasure) requires a different approach for event stores.
+```rust
+#[tokio::test]
+async fn test_create_order() {
+    // GIVEN: empty event store (in-memory, same trait as production)
+    let es: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
 
-**Pattern: Crypto-Shredding** (Mathias Verraes, 2019)
+    // WHEN: create order command
+    let handler = CreateOrderHandler::new(es.clone());
+    let result = handler.execute(CreateOrder {
+        tenant_id: TENANT, customer_ref: "cust-1".into(), items: vec![...],
+    }).await.unwrap();
 
-Each data subject gets a unique AES-256 encryption key. Sensitive fields in event payloads are encrypted before appending. Deleting the key renders the encrypted fields permanently unreadable, achieving effective erasure without mutating the event stream.
+    // THEN: order.created event was appended
+    let events = es.load_stream(TENANT, result.aggregate_id).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].stream_domain, "commerce");
+    assert_eq!(events[0].stream_entity, "order");
+    assert_eq!(events[0].event_action, "created");
+}
 
-```sql
--- Per-subject encryption keys
-CREATE TABLE encryption_keys (
-    subject_id      UUID PRIMARY KEY,           -- maps to user_id
-    tenant_id       UUID NOT NULL,
-    encryption_key  BYTEA NOT NULL,             -- AES-256 key (32 bytes)
-    algorithm       TEXT NOT NULL DEFAULT 'AES-256-GCM',
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    destroyed_at    TIMESTAMPTZ                 -- NULL until erasure request
-);
+#[tokio::test]
+async fn test_cannot_confirm_cancelled_order() {
+    // GIVEN: order was created then cancelled
+    let es: Arc<dyn EventStore> = Arc::new(InMemoryEventStore::new());
+    // ... setup events ...
 
-ALTER TABLE encryption_keys ENABLE ROW LEVEL SECURITY;
-CREATE POLICY tenant_isolation_keys ON encryption_keys
-    USING (tenant_id = current_setting('app.tenant_id')::UUID);
-```
-
-**Event payload structure with crypto-shredding:**
-
-```json
-{
-  "name": "ENC:v1:base64ciphertext...",
-  "email": "ENC:v1:base64ciphertext...",
-  "plan": "premium",
-  "currency": "USD"
+    // WHEN: try to confirm → THEN: rejected
+    let handler = ConfirmOrderHandler::new(es.clone());
+    let err = handler.execute(ConfirmOrder {
+        tenant_id: TENANT, order_id: ORDER_ID,
+    }).await.unwrap_err();
+    assert!(matches!(err, DomainError::InvalidStateTransition { .. }));
 }
 ```
 
-Non-sensitive fields (`plan`, `currency`) remain in cleartext. Sensitive fields are encrypted with the subject's key. The `ENC:v1:` prefix allows the deserializer to detect and route to the decryption pipeline.
+### Test Pyramid
 
-**Erasure flow:**
+| Layer           | What                                      | Adapter Used                | Speed        | Count              |
+| --------------- | ----------------------------------------- | --------------------------- | ------------ | ------------------ |
+| **Unit**        | Aggregate decide/evolve, upcasters        | None (pure functions)       | Milliseconds | Many               |
+| **Integration** | Command/query handlers                    | In-memory adapters          | Milliseconds | Moderate           |
+| **Contract**    | Port compliance, event schema validation  | Both in-memory and Postgres | Seconds      | Per port           |
+| **E2E**         | Full command → event → projection → query | Production adapters         | Seconds      | Few critical paths |
 
-```mermaid
-sequenceDiagram
-    participant DPO as Data Protection Officer
-    participant API as Erasure API
-    participant KS as Key Store
-    participant PW as Projection Workers
-    participant RM as Read Model
+### Port Compliance Tests
 
-    DPO->>API: DELETE /subjects/{user_id}/data
-    API->>KS: DELETE FROM encryption_keys WHERE subject_id = $1
-    Note over KS: Key destroyed — encrypted fields<br/>in event store are now unreadable
-    API->>PW: Trigger re-projection for affected aggregates
-    PW->>RM: Rebuild read models (encrypted fields become "[REDACTED]")
-    API-->>DPO: 202 Accepted (erasure complete)
+```rust
+// tests/event_store_compliance.rs
+// Run these tests against EVERY EventStore implementation.
+// Guarantees adapter correctness regardless of technology.
+
+#[async_trait]
+trait EventStoreTests {
+    async fn make_store(&self) -> Arc<dyn EventStore>;
+}
+
+async fn test_append_and_load_roundtrip(store: Arc<dyn EventStore>) {
+    // Events appended must be loadable in order
+    let version = store.append(TENANT, AGG_ID, "commerce", "commerce.order", 0, &events).await.unwrap();
+    let loaded = store.load_stream(TENANT, AGG_ID).await.unwrap();
+    assert_eq!(loaded.len(), events.len());
+    assert_eq!(version, events.len() as i32);
+}
+
+async fn test_optimistic_concurrency_conflict(store: Arc<dyn EventStore>) {
+    // Second append with same expected_version must fail
+    store.append(TENANT, AGG_ID, "commerce", "commerce.order", 0, &events).await.unwrap();
+    let err = store.append(TENANT, AGG_ID, "commerce", "commerce.order", 0, &events).await.unwrap_err();
+    assert!(matches!(err, DomainError::ConcurrencyConflict { .. }));
+}
+
+async fn test_global_position_is_monotonic(store: Arc<dyn EventStore>) {
+    // Positions must be gapless and strictly increasing
+    // ...
+}
+
+// Run against both implementations:
+#[tokio::test] async fn in_memory_roundtrip() { test_append_and_load_roundtrip(InMemoryEventStore::new()).await; }
+#[tokio::test] async fn postgres_roundtrip() { test_append_and_load_roundtrip(PgEventStore::new(pg_pool()).await).await; }
 ```
-
-**Complementary pattern: Forgettable Payloads** (Verraes). Sensitive data never enters the event store at all. Events contain only a reference to a separate `personal_data` table. Deletion is a simple `DELETE` on the personal data table.
-
-```sql
--- Forgettable payload store (deletable, unlike events)
-CREATE TABLE personal_data (
-    subject_id  UUID NOT NULL,
-    tenant_id   UUID NOT NULL,
-    data_key    TEXT NOT NULL,              -- 'profile', 'billing_address', etc.
-    data        JSONB NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    PRIMARY KEY (subject_id, data_key)
-);
-```
-
-**Which to use:**
-
-| Approach                 | When                                                           | Complexity              | Legal clarity                                                   |
-| ------------------------ | -------------------------------------------------------------- | ----------------------- | --------------------------------------------------------------- |
-| **Crypto-shredding**     | PII must travel with the event for projection correctness      | Higher (key management) | Medium (encrypted data is still "personal data" per Recital 26) |
-| **Forgettable payloads** | PII can be referenced by pointer without affecting projections | Lower (simple DELETE)   | Higher (data is fully deleted)                                  |
-| **Both**                 | Defense in depth                                               | Highest                 | Highest                                                         |
-
-**Production references:** Axon Framework's Data Protection Module uses `@SensitiveData` annotations. EventStoreDB/Kurrent publishes reference samples (`kurrent-io/samples/Crypto_Shredding`). Oskar Dudycz documents the full pattern for .NET.
 
 ---
 
-### 11.2 Domain Events vs Integration Events
+## 16. Implementation Order
 
-Not all events should cross bounded context boundaries. Internal domain events carry rich, context-specific data. Integration events are public contracts -- lean, stable, and versioned separately.
-
-**The split:**
-
-| Aspect           | Domain Event                         | Integration Event                    |
-| ---------------- | ------------------------------------ | ------------------------------------ |
-| Scope            | Within a single bounded context      | Crosses bounded context boundaries   |
-| Consumers        | Same context's projections, policies | Other services, other teams          |
-| Schema ownership | Internal, can change freely          | Public contract, must be versioned   |
-| Payload          | Rich, includes internal IDs          | Lean, uses public-facing identifiers |
-| Storage          | Event store (immutable, forever)     | Outbox table (ephemeral, relayed)    |
-
-**Example:**
-
-```text
-Domain event (internal to commerce):
-  commerce.order.line_item_added {
-    sku: "SKU-42",
-    quantity: 2,
-    unit_price_cents: 2999,
-    warehouse_bin: "A3-14",        -- internal detail
-    pricing_rule_id: "rule-789"    -- internal detail
-  }
-
-Integration event (published to billing):
-  commerce.order.placed {
-    order_id: "ord-123",           -- public identifier
-    customer_ref: "cust-456",      -- public identifier
-    total_amount_cents: 5998,
-    currency: "USD"
-    -- no warehouse_bin, no pricing_rule_id
-  }
 ```
+Phase 1: Domain Core (zero dependencies)
+═══════════════════════════════════════════
+1. Value objects: TenantId, AggregateId, EventId, Version, Money, etc.
+2. Port traits: EventStore, ReadModelStore, RelationStore, etc.
+3. Event types: namespaced type validation
+4. Aggregate base: decide/evolve pattern + typestate
+5. Upcaster framework: pure function pipeline
+6. Error code registry: i18n-ready error catalog
 
-**Outbox pattern** (Chris Richardson, "Microservices Patterns"):
+Phase 2: In-Memory Adapters + Tests
+═══════════════════════════════════════════
+7. InMemoryEventStore + compliance tests
+8. InMemoryReadModelStore + compliance tests
+9. InMemoryRelationStore + compliance tests
+10. Fake adapters for auth, payments, cache
+11. First aggregate implementation with Given/When/Then tests
 
-Integration events are written to an `outbox` table in the same transaction that appends domain events. A separate relay process publishes them to external consumers.
+Phase 3: Production Adapters
+═══════════════════════════════════════════
+12. PgEventStore (PL/pgSQL, gapless counter, concurrency)
+13. PgReadModelStore (JSONB, GIN indexes)
+14. PgRelationStore (forward/reverse indexes)
+15. PgTenantIsolation via RLS
+16. PgCheckpointStore
+17. Run compliance tests against Postgres adapters
 
-```sql
-CREATE TABLE integration_outbox (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       UUID NOT NULL,
-    aggregate_type  TEXT NOT NULL,
-    aggregate_id    UUID NOT NULL,
-    event_type      TEXT NOT NULL,             -- integration event type
-    schema_version  SMALLINT NOT NULL DEFAULT 1,
-    payload         JSONB NOT NULL,
-    correlation_id  UUID,
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    published_at    TIMESTAMPTZ               -- NULL until relay confirms delivery
-);
+Phase 4: Application Layer
+═══════════════════════════════════════════
+18. Command handlers
+19. Query handlers with caching
+20. Projection workers (domain-scoped polling)
+21. PgEventNotifier (LISTEN/NOTIFY adapter, optional)
 
-CREATE INDEX idx_outbox_unpublished ON integration_outbox (created_at)
-    WHERE published_at IS NULL;
+Phase 5: External Integrations
+═══════════════════════════════════════════
+22. IdentityProvider adapter (Zitadel/Keycloak OIDC)
+23. PaymentGateway adapter (Stripe/PayPal)
+24. HTTP/gRPC transport adapters (axum/tonic)
+
+Phase 6: Production Hardening
+═══════════════════════════════════════════
+25. Process managers + saga coordination
+26. Dead letter queue + retry with backoff
+27. GDPR: EncryptionKeyStore + crypto-shredding
+28. Integration events: OutboxPublisher + ACL translators
+29. Observability: OpenTelemetry traces, projection lag metrics, alerting
+30. Table partitioning (when scale demands it)
 ```
-
-```mermaid
-sequenceDiagram
-    participant CH as Command Handler
-    participant ES as Event Store
-    participant OB as Outbox Table
-    participant RL as Outbox Relay
-    participant EXT as External Consumers
-
-    CH->>ES: Append domain events
-    CH->>OB: Write integration event (same transaction)
-    Note over ES,OB: Single atomic transaction
-
-    loop Relay process
-        RL->>OB: SELECT WHERE published_at IS NULL
-        RL->>EXT: Publish to message broker / HTTP
-        RL->>OB: UPDATE SET published_at = now()
-    end
-```
-
-**Why not just expose domain events?** Vaughn Vernon (IDDD Chapter 13): Exposing domain events as integration events couples consumers to your internal model. When you refactor internals, every downstream consumer breaks. The integration event is a **translation boundary** -- a stable public contract.
-
-**In an event-sourced system**, the outbox can be replaced by a **projection** that transforms domain events into integration events. The event store is already the journal -- no separate outbox table is needed if you build an "integration event projector" that publishes lean, public events derived from the domain stream.
 
 ---
 
-### 11.3 Idempotency and Deduplication
-
-**Three levels of the deduplication problem:**
-
-**A) Write-side: preventing duplicate appends.**
-
-Already solved by the `UNIQUE (aggregate_id, aggregate_version)` constraint. Two commands producing version 5 for the same aggregate -- first writer wins, second gets a constraint violation. Standard across Marten, EventStoreDB, Message DB, and Prooph.
-
-**B) API-level: preventing duplicate commands from clients.**
-
-Clients may retry after network timeouts. Without deduplication, the retry produces duplicate events.
-
-```sql
-CREATE TABLE idempotency_keys (
-    key             TEXT NOT NULL,            -- client-provided idempotency key
-    tenant_id       UUID NOT NULL,
-    aggregate_id    UUID,
-    result          JSONB,                    -- cached response
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at      TIMESTAMPTZ NOT NULL DEFAULT now() + INTERVAL '24 hours',
-
-    PRIMARY KEY (tenant_id, key)
-);
-
--- TTL cleanup (run periodically)
--- DELETE FROM idempotency_keys WHERE expires_at < now();
-```
-
-The command handler checks `idempotency_keys` before executing. If the key exists, return the cached result without re-executing. If not, execute, store the result, and return.
-
-**C) Read-side: preventing duplicate event processing (Inbox Pattern).**
-
-When projection handlers consume events from external sources (integration events, webhooks), duplicates can arrive. The inbox pattern tracks processed message IDs.
-
-```sql
-CREATE TABLE handler_inbox (
-    message_id      UUID NOT NULL,
-    handler_name    TEXT NOT NULL,
-    processed_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-
-    PRIMARY KEY (message_id, handler_name)
-);
-```
-
-Processing pattern: `INSERT INTO handler_inbox ... ON CONFLICT DO NOTHING`. If rows affected = 1, process the event. If 0 (conflict), skip -- already processed.
-
-**When the inbox is NOT needed:** For internal projection workers consuming from the event store via `global_position` checkpointing, deduplication is implicit. The worker never re-processes events before its checkpoint. Projections just need to be idempotent (use `UPSERT`, not `INSERT`). Marten's Async Daemon uses this approach -- no inbox table, just checkpoints + idempotent projections.
-
----
-
-### 11.4 Saga and Process Manager
-
-Multi-step business processes that span multiple aggregates require coordination. Two patterns:
-
-**Choreography (Saga):** Decentralized. Each aggregate reacts to events from others. No coordinator.
-
-```mermaid
-sequenceDiagram
-    participant OS as Order Service
-    participant PS as Payment Service
-    participant IS as Inventory Service
-    participant NS as Notification Service
-
-    OS->>OS: commerce.order.placed
-    Note over PS: Reacts to commerce.order.placed
-    PS->>PS: billing.payment.charged
-    Note over IS: Reacts to billing.payment.charged
-    IS->>IS: commerce.inventory.reserved
-    Note over NS: Reacts to commerce.inventory.reserved
-    NS->>NS: notifications.email.sent
-
-    Note over PS: If payment fails:
-    PS->>PS: billing.payment.failed
-    Note over OS: Reacts to billing.payment.failed
-    OS->>OS: commerce.order.cancelled (compensation)
-```
-
-**Orchestration (Process Manager):** A stateful coordinator that tracks progress and sends commands.
-
-```sql
--- Process manager instances (stateful coordinators)
-CREATE TABLE process_managers (
-    id              UUID PRIMARY KEY,
-    tenant_id       UUID NOT NULL,
-    process_type    TEXT NOT NULL,           -- 'order_fulfillment', 'subscription_renewal'
-    state           TEXT NOT NULL,           -- current step: 'awaiting_payment', 'awaiting_shipment'
-    data            JSONB NOT NULL,          -- accumulated context for decision-making
-    started_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    completed_at    TIMESTAMPTZ,
-    timed_out_at    TIMESTAMPTZ
-);
-
--- Association table: maps incoming events to process manager instances
-CREATE TABLE process_associations (
-    process_id      UUID NOT NULL REFERENCES process_managers(id),
-    association_key TEXT NOT NULL,           -- 'order_id', 'payment_id'
-    association_val TEXT NOT NULL,           -- actual value
-    PRIMARY KEY (association_key, association_val)
-);
-
-CREATE INDEX idx_process_active ON process_managers (process_type, state)
-    WHERE completed_at IS NULL AND timed_out_at IS NULL;
-
-CREATE INDEX idx_process_timeout ON process_managers (updated_at)
-    WHERE completed_at IS NULL AND timed_out_at IS NULL;
-```
-
-**How it works:**
-
-```mermaid
-stateDiagram-v2
-    [*] --> AwaitingPayment : order.placed
-    AwaitingPayment --> AwaitingInventory : payment.charged
-    AwaitingPayment --> Cancelled : payment.failed → send cancel_order command
-    AwaitingInventory --> AwaitingShipment : inventory.reserved
-    AwaitingInventory --> RefundingPayment : inventory.insufficient → send refund command
-    RefundingPayment --> Cancelled : payment.refunded
-    AwaitingShipment --> Completed : shipment.dispatched
-    Completed --> [*]
-    Cancelled --> [*]
-```
-
-When an event arrives, the system looks up matching process managers via `process_associations`, loads the state, applies the transition, and emits commands for the next step. Timeouts are detected by a background job scanning `process_managers WHERE updated_at < now() - timeout_interval`.
-
-**When to use which:**
-
-| Criteria        | Choreography                          | Orchestration                      |
-| --------------- | ------------------------------------- | ---------------------------------- |
-| Number of steps | 2-3                                   | 4+                                 |
-| Failure modes   | Simple (each step compensates itself) | Complex (conditional compensation) |
-| Visibility      | Hard to trace end-to-end              | Easy (state machine in one place)  |
-| Coupling        | Lower                                 | Higher to coordinator              |
-
-**Production reference:** Axon Framework's `@SagaEventHandler` + `SagaStore` (JPA/JDBC). Axon routes events to saga instances via an association table with `(saga_type, association_key, association_value)` lookups.
-
----
-
-### 11.5 Dead Letter Queue
-
-When a projection handler fails on a specific event (bad data, schema mismatch, handler bug), the system must not block all subsequent events. The dead letter queue captures failed events for later inspection and replay.
-
-```sql
-CREATE TABLE dead_letter_events (
-    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id       UUID,
-    event_id        UUID NOT NULL,
-    global_position BIGINT NOT NULL,
-    stream_id       UUID,
-    event_type      TEXT,
-    handler_name    TEXT NOT NULL,              -- which projection/handler failed
-    error_message   TEXT NOT NULL,
-    error_stack     TEXT,
-    payload         JSONB,                     -- snapshot of event for debugging
-    retry_count     INT NOT NULL DEFAULT 0,
-    max_retries     INT NOT NULL DEFAULT 5,
-    next_retry_at   TIMESTAMPTZ,               -- exponential backoff
-    status          TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending', 'retrying', 'exhausted', 'resolved')),
-    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    resolved_at     TIMESTAMPTZ
-);
-
-CREATE INDEX idx_dlq_retry ON dead_letter_events (status, next_retry_at)
-    WHERE status IN ('pending', 'retrying');
-CREATE INDEX idx_dlq_handler ON dead_letter_events (handler_name, status);
-```
-
-**Processing strategy:**
-
-```mermaid
-flowchart TD
-    EVT["Event arrives at handler"]
-    EVT --> TRY["Try processing"]
-    TRY -->|Success| NEXT["Advance checkpoint"]
-    TRY -->|Failure| RETRY{"Retry count < max?"}
-    RETRY -->|Yes| BACKOFF["Wait 2^retry_count seconds"]
-    BACKOFF --> TRY
-    RETRY -->|No| DLQ["Insert into dead_letter_events\nstatus = 'exhausted'"]
-    DLQ --> SKIP["Skip event, advance checkpoint"]
-    SKIP --> ALERT["Alert: dead letter created"]
-```
-
-**Retry formula:** `next_retry_at = now() + (base_delay * 2^retry_count)` with a cap (e.g., max 5 minutes between retries).
-
-**Resolution workflow:** After the handler bug is fixed, an operator can replay dead-lettered events:
-
-```sql
--- Re-queue exhausted events for a specific handler after a fix
-UPDATE dead_letter_events
-SET status = 'pending', retry_count = 0, next_retry_at = now()
-WHERE handler_name = 'commerce_product_projection'
-  AND status = 'exhausted';
-```
-
-**Production reference:** Marten's Async Daemon writes failed events to `mt_doc_deadletterevent` with full exception details. The daemon skips the poison event and continues processing. Operators inspect via Marten's built-in admin API.
-
-**Critical design decision:** Dead-lettering means the projection has a temporary gap. For projections where gaps are unacceptable (e.g., financial totals), halt the projection entirely and alert instead of skipping.
-
----
-
-### 11.6 Anti-Corruption Layer
-
-When consuming events from another bounded context, never use the upstream context's event types directly. The Anti-Corruption Layer (ACL) translates foreign events into your context's language.
-
-**Pattern** (Eric Evans, DDD Chapter 14):
-
-```mermaid
-flowchart LR
-    subgraph Upstream["Shipping Context"]
-        SE["ShipmentDispatched\n---\nshipment_id\ncarrier\nweight_kg\ninternal_route_code"]
-    end
-
-    subgraph ACL["Anti-Corruption Layer\n(owned by Billing)"]
-        TR["Event Translator\n---\nDrops internal_route_code\nRenames shipment_id → delivery_ref\nAdds estimated_cost via rate lookup"]
-    end
-
-    subgraph Downstream["Billing Context"]
-        BE["BillableDeliveryInitiated\n---\ndelivery_ref\ncarrier_name\nbillable_weight\nestimated_cost"]
-    end
-
-    SE --> ACL --> BE
-```
-
-**Implementation as a projection:**
-
-The ACL is a specialized projection worker that subscribes to the upstream context's events and publishes translated events into the downstream context.
-
-```text
-Upstream event:                         Downstream event:
-  shipping.shipment.dispatched    →       billing.delivery.initiated
-  shipping.shipment.delivered     →       billing.delivery.completed
-  shipping.shipment.returned      →       billing.delivery.reversed
-
-Dropped (not relevant to billing):
-  shipping.shipment.route_changed
-  shipping.shipment.label_printed
-```
-
-**Rules:**
-
-1. The ACL belongs to the **downstream** context. The upstream never changes to accommodate downstream consumers.
-2. The downstream never imports the upstream's event types/classes (Vaughn Vernon, IDDD Chapter 13).
-3. The ACL filters events (not all upstream events are relevant), renames fields, enriches data (lookups), and drops internal details.
-
-**When NOT to use:** If both contexts are owned by the same team and share a model, a Shared Kernel relationship is simpler. ACLs are for contexts with different models or different team ownership.
-
----
-
-### 11.7 Observability
-
-**Three pillars for event-sourced systems: metrics, traces, and structured logs.**
-
-**Critical metrics to instrument:**
-
-| Metric                      | Formula                                        | Alert threshold                    |
-| --------------------------- | ---------------------------------------------- | ---------------------------------- |
-| **Projection lag**          | `max(global_position) - projection_checkpoint` | > N events behind (per projection) |
-| **Projection throughput**   | Events processed per second per projection     | Drop below baseline                |
-| **Event append latency**    | p50/p95/p99 of `append_events` duration        | p99 > 50ms                         |
-| **Event store growth**      | Events appended per minute                     | Anomalous spikes                   |
-| **Dead letter count**       | `COUNT(*) WHERE status != 'resolved'`          | > 0                                |
-| **Active process managers** | `COUNT(*) WHERE completed_at IS NULL`          | Sustained growth (stuck processes) |
-| **Checkpoint drift**        | Max position gap between projections           | Growing divergence                 |
-
-**Distributed tracing with correlation_id:**
-
-The `correlation_id` on the events table connects the entire business flow, even across async boundaries where OpenTelemetry trace context expires.
-
-```mermaid
-flowchart TD
-    REQ["HTTP Request\ntrace_id: T1\ncorrelation_id: C1"]
-    REQ --> CMD["Command Handler\nspan: handle_command"]
-    CMD --> EVT["Event appended\ncorrelation_id: C1\ncausation_id: null"]
-    EVT --> PROJ["Projection Worker\n(minutes later)\nnew span, links to C1"]
-    EVT --> SAGA["Process Manager\nspan: saga_step\ncorrelation_id: C1"]
-    SAGA --> EVT2["Event appended\ncorrelation_id: C1\ncausation_id: EVT.id"]
-```
-
-Every event carries `correlation_id` (the originating user request) and `causation_id` (the event that triggered this event). This creates a causal DAG that can be visualized regardless of timing.
-
-**Projection health query:**
-
-```sql
--- Dashboard: projection lag per worker
-SELECT
-    pc.projection_name,
-    pc.domain,
-    pc.last_position,
-    gpc.position AS current_max,
-    gpc.position - pc.last_position AS lag
-FROM projection_checkpoints pc
-CROSS JOIN global_position_counter gpc
-ORDER BY lag DESC;
-```
-
-**Production references:** Marten 7.10+ exports OpenTelemetry traces and metrics natively (Jeremy Miller). Oskar Dudycz documents full OpenTelemetry setup for event-sourced systems. Prometheus + Grafana is the common observability stack.
-
----
-
-### 11.8 Testing Strategy
-
-Event-sourced systems enable uniquely powerful testing patterns because all state transitions are explicit as events.
-
-**A) Aggregate testing: Given/When/Then**
-
-Originated in Axon Framework's `AggregateTestFixture`. Tests are pure -- no database, no I/O.
-
-```text
-GIVEN: [OrderCreated{id, customer}]                    -- historical events (establish state)
-WHEN:  AddLineItem{order_id, sku, qty}                 -- command to execute
-THEN:  [LineItemAdded{order_id, sku, qty}]             -- expected new events
-
-GIVEN: [OrderCreated{...}, OrderShipped{...}]          -- order is already shipped
-WHEN:  AddLineItem{order_id, sku, qty}                 -- try to modify
-THEN:  REJECT with OrderAlreadyShippedException         -- business rule violation
-```
-
-**B) Decider pattern testing** (Jeremie Chassaing, adopted by Oskar Dudycz):
-
-A pure-functional alternative. The Decider has three functions:
-
-```text
-decide:       (command, state) → events
-evolve:       (state, event) → state
-initialState: () → state
-```
-
-Testing is just calling functions -- no framework needed:
-
-```text
-state  = initialState |> evolve(OrderCreated{...})
-events = decide(AddLineItem{...}, state)
-assert events == [LineItemAdded{...}]
-```
-
-**C) Projection testing: Event-in / State-out**
-
-```text
-GIVEN: read_entities is empty
-WHEN:  ProductCreated{id: "p1", name: "Widget", price: 2999}
-THEN:  read_entities contains {id: "p1", type: "commerce.product", data: {name: "Widget", price: 2999}}
-
-WHEN:  ProductPriceUpdated{id: "p1", price: 3999}
-THEN:  read_entities["p1"].data.price == 3999
-```
-
-Tested with integration tests against a real PostgreSQL instance (Docker). No mocking the database.
-
-**D) Event contract testing:**
-
-Events are the API between write and read sides. Treat their schemas as contracts:
-
-```text
-1. Define JSON Schema for each event type and schema_version
-2. Validate every appended event against its schema (in tests and optionally at runtime)
-3. Upcaster tests: verify that v1 payload → upcaster chain → current schema produces valid output
-4. Consumer-driven contracts (Pact) for integration events crossing bounded contexts
-```
-
-**E) End-to-end flow testing:**
-
-```text
-1. Send command via API
-2. Wait for projection to catch up (poll checkpoint until it advances)
-3. Query read model
-4. Assert the read model reflects the command's effect
-```
-
-**Test pyramid for event-sourced systems:**
-
-| Layer           | What                                                       | Speed        | Count              |
-| --------------- | ---------------------------------------------------------- | ------------ | ------------------ |
-| **Unit**        | Aggregate Given/When/Then, Decider functions, upcasters    | Milliseconds | Many               |
-| **Integration** | Projections against real Postgres, event store round-trips | Seconds      | Moderate           |
-| **Contract**    | Event schema validation, consumer-driven contracts         | Seconds      | Per event type     |
-| **E2E**         | Full command → event → projection → query flow             | Seconds      | Few critical paths |
-
----
-
-### 11.9 Table Partitioning Strategy
-
-PostgreSQL partitioning splits a large table into smaller physical pieces, improving query performance through partition pruning and enabling easier data lifecycle management.
-
-**When to partition:**
-
-| Event count | Recommendation                                                               |
-| ----------- | ---------------------------------------------------------------------------- |
-| < 50M       | Single table with proper indexes. Partitioning adds overhead for no gain.    |
-| 50M - 500M  | Consider hash partitioning by `tenant_id` for multi-tenant isolation.        |
-| 500M+       | Partition by range on `global_position` for time-based lifecycle management. |
-
-**Strategy A: Hash partition by tenant_id (multi-tenant isolation):**
-
-```sql
-CREATE TABLE events (
-    id                UUID NOT NULL DEFAULT gen_random_uuid(),
-    global_position   BIGINT NOT NULL,
-    tenant_id         UUID NOT NULL,
-    -- ... all other columns ...
-    UNIQUE (aggregate_id, aggregate_version),
-    UNIQUE (global_position)
-) PARTITION BY HASH (tenant_id);
-
--- Create N partitions (8 is a good starting point for moderate tenant count)
-CREATE TABLE events_p0 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 0);
-CREATE TABLE events_p1 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 1);
-CREATE TABLE events_p2 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 2);
-CREATE TABLE events_p3 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 3);
-CREATE TABLE events_p4 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 4);
-CREATE TABLE events_p5 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 5);
-CREATE TABLE events_p6 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 6);
-CREATE TABLE events_p7 PARTITION OF events FOR VALUES WITH (MODULUS 8, REMAINDER 7);
-```
-
-Queries with `WHERE tenant_id = ?` only scan one partition. Marten V7.25+ uses this approach natively.
-
-**Strategy B: Range partition by global_position (archival):**
-
-```sql
-CREATE TABLE events (
-    -- ... all columns ...
-) PARTITION BY RANGE (global_position);
-
--- Managed by pg_partman for automatic partition creation
-CREATE TABLE events_p_0_10m PARTITION OF events
-    FOR VALUES FROM (0) TO (10000000);
-CREATE TABLE events_p_10m_20m PARTITION OF events
-    FOR VALUES FROM (10000000) TO (20000000);
--- pg_partman creates new partitions automatically
-```
-
-Enables hot/cold separation: old partitions can be moved to slower storage or marked as read-only tablespace.
-
-**Trade-offs:**
-
-- Cross-partition queries (global ordering across all tenants) become more expensive.
-- Schema migrations must be applied to all partitions.
-- `UNIQUE` constraints must include the partition key -- `UNIQUE (aggregate_id, aggregate_version)` becomes `UNIQUE (tenant_id, aggregate_id, aggregate_version)` for hash partitioning.
-- Use `pg_partman` for automated partition management in production.
-
-**Production reference:** Marten V7.25 added native partitioning support. Jeremy Miller reports significant performance improvements for the async daemon's catch-up queries due to partition pruning.
-
----
-
-### 11.10 Event Notification Mechanism
-
-Projection workers need to know when new events are available. Three approaches, with the hybrid being the production standard.
-
-**A) Polling (simplest, most reliable):**
-
-```sql
-SELECT * FROM events
-WHERE global_position > $last_checkpoint
-ORDER BY global_position
-LIMIT $batch_size;
-```
-
-Simple but introduces latency proportional to the polling interval. At 100ms intervals, you get ~100ms latency but 864K queries/day per consumer. Acceptable for most projections.
-
-**B) LISTEN/NOTIFY (low-latency push):**
-
-```sql
-CREATE OR REPLACE FUNCTION notify_new_event()
-RETURNS TRIGGER AS $$
-BEGIN
-    PERFORM pg_notify('new_events', NEW.global_position::text);
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER trg_notify_event
-    AFTER INSERT ON events
-    FOR EACH ROW EXECUTE FUNCTION notify_new_event();
-```
-
-Consumer side: `LISTEN new_events;` then poll when notified.
-
-**Critical limitations** (documented by Recall.ai, 2025):
-
-1. **NOTIFY acquires a global lock on `pg_notify_queue` during COMMIT**, serializing concurrent writers under high throughput.
-2. **Notifications are ephemeral** -- if the listener disconnects (network, restart, PgBouncer), all notifications during the outage are lost permanently.
-3. **Incompatible with PgBouncer transaction pooling mode** (the most common mode).
-4. Only works on the PostgreSQL primary -- does not scale with read replicas.
-
-**C) Hybrid: LISTEN/NOTIFY as hint + polling as catch-all (production pattern):**
-
-```mermaid
-flowchart TD
-    subgraph Writer["Write Path"]
-        APP["append_events()"] --> TRG["AFTER INSERT trigger"]
-        TRG --> NOTIFY["pg_notify('new_events', position)"]
-    end
-
-    subgraph Consumer["Projection Worker"]
-        LISTEN["LISTEN new_events"]
-        POLL["Poll loop (fallback interval: 1s)"]
-
-        LISTEN -->|"notification received"| WAKE["Wake immediately"]
-        POLL -->|"interval elapsed"| WAKE
-        WAKE --> FETCH["SELECT FROM events WHERE global_position > checkpoint"]
-        FETCH --> PROCESS["Process batch"]
-        PROCESS --> CHECKPOINT["Update checkpoint"]
-        CHECKPOINT --> POLL
-    end
-
-    NOTIFY -.->|"best-effort hint"| LISTEN
-```
-
-The polling loop runs regardless of LISTEN/NOTIFY. LISTEN/NOTIFY merely interrupts the sleep between polls, reducing latency from `polling_interval` to near-zero when notifications are received. If LISTEN/NOTIFY fails (disconnect, PgBouncer issue), the system degrades gracefully to polling-only -- no events are lost.
-
-**This is the pattern used by Eventide/Message DB** (the reference event store for PostgreSQL). Consumers poll using `get_category_messages(category, position, batch_size)`. LISTEN/NOTIFY is an optional optimization to break out of the sleep early.
-
-**When NOT to use LISTEN/NOTIFY at all:**
-
-- PgBouncer in transaction pooling mode (the common configuration)
-- Write throughput > ~1000 TPS (the NOTIFY lock becomes a bottleneck)
-- In these cases, pure polling with 100-500ms intervals is preferred
+## 17. Risks and Mitigations
+
+| Risk                                          | Mitigation                                                                                             |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| Event store becomes write bottleneck          | Partition by tenant_id. Connection pooling. At extreme scale, shard by domain.                         |
+| Projection lag causes stale reads             | Return version in write response. Client polls until projection catches up.                            |
+| Upcaster chain grows long for ancient events  | Periodic snapshot creation. Optional background copy-and-transform.                                    |
+| Document query performance degrades           | Adapter uses appropriate indexes (GIN for Postgres, GSI for DynamoDB). Keep read model payloads flat.  |
+| Adapter lock-in via port leakage              | Port compliance tests catch any adapter-specific assumptions leaking into domain code.                 |
+| Schema_version mismatch between writer/reader | Upcasters are pure functions tested independently. Version is explicit on every event.                 |
+| Over-abstraction makes debugging harder       | Keep adapter implementations straightforward. Structured logging with correlation_id traces full flow. |
