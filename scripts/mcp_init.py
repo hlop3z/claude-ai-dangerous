@@ -4,6 +4,9 @@ import platform
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MCP_JSON_FILE = ".mcp.json"
+
 
 def npx_command(package: Any, extra_args: Any = None) -> Any:
     extra_args = extra_args or []
@@ -31,14 +34,11 @@ def generate_config(project_root: Any) -> Any:
 
 
 def main():
-    mcp_json_file = ".mcp.json"
-    project_root = Path.cwd().resolve()
-    config = generate_config(project_root)
-
-    output_file = project_root / mcp_json_file
+    output_file = REPO_ROOT / MCP_JSON_FILE
+    config_string = generate_config(REPO_ROOT)
 
     with open(output_file, "w") as f:
-        json.dump(config, f, indent=2)
+        json.dump(config_string, f, indent=2)
 
     try:
         os.chmod(output_file, 0o600)
@@ -46,7 +46,7 @@ def main():
         pass
 
     print(f"MCP config written to: {output_file}")
-    print(f"Filesystem access limited to: {project_root}")
+    print(f"Filesystem access limited to: {REPO_ROOT}")
     print(f"Detected OS: {platform.system()}")
 
 

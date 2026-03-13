@@ -80,12 +80,14 @@ Before writing ANY implementation code:
 ## Language-Specific Testing Patterns
 
 ### Rust
+
 - Framework: `#[cfg(test)]` module + `#[test]`, or `cargo-nextest`
 - Assertions: `assert_eq!`, `assert!(matches!(...))`, `assert!(result.is_err())`
 - Mocking: trait objects or generics with test implementations
 - Run: `cargo test` or `cargo nextest run`
 
 ### Python
+
 - Framework: `pytest`
 - Assertions: plain `assert`, `pytest.raises` for errors
 - Mocking: `unittest.mock.patch` for adapters, prefer dependency injection over patching
@@ -93,6 +95,7 @@ Before writing ANY implementation code:
 - Run: `pytest -v` or `pytest -x` (stop on first failure)
 
 ### Go
+
 - Framework: stdlib `testing` package
 - Assertions: manual checks or `testify/assert`
 - Table-driven tests for multiple scenarios
@@ -100,6 +103,7 @@ Before writing ANY implementation code:
 - Run: `go test ./...`
 
 ### TypeScript / JavaScript
+
 - Framework: `vitest` (preferred), `jest`, or native `node --test`
 - Assertions: `expect(x).toBe(y)`, `expect(() => fn()).toThrow()`
 - Mocking: `vi.mock()` for modules, dependency injection for services
@@ -107,15 +111,15 @@ Before writing ANY implementation code:
 
 ## Anti-Patterns to Block
 
-| If you catch yourself doing this... | Stop and do this instead |
-|--------------------------------------|--------------------------|
-| Writing implementation before a test | Write the failing test first |
-| Writing multiple tests before any implementation | One test at a time — RED then GREEN |
-| Testing private/internal methods | Test observable behavior through public API |
-| Mocking everything | Only mock I/O boundaries; test core logic directly |
-| Writing a test that passes immediately | The test isn't driving new behavior — rethink it |
-| Skipping the refactor step | Refactor now; technical debt compounds fast |
-| Hard-coding values to pass tests | Triangulate — add another test to force real logic |
+| If you catch yourself doing this...              | Stop and do this instead                           |
+| ------------------------------------------------ | -------------------------------------------------- |
+| Writing implementation before a test             | Write the failing test first                       |
+| Writing multiple tests before any implementation | One test at a time — RED then GREEN                |
+| Testing private/internal methods                 | Test observable behavior through public API        |
+| Mocking everything                               | Only mock I/O boundaries; test core logic directly |
+| Writing a test that passes immediately           | The test isn't driving new behavior — rethink it   |
+| Skipping the refactor step                       | Refactor now; technical debt compounds fast        |
+| Hard-coding values to pass tests                 | Triangulate — add another test to force real logic |
 
 ## Session Workflow
 
