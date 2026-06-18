@@ -1,4 +1,4 @@
-# Dangerous Development
+# Project: Dangerous Development
 
 ```sh
 claude --dangerously-skip-permissions
