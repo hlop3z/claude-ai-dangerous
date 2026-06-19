@@ -28,7 +28,7 @@ RAW_INSTALL_URL="https://raw.githubusercontent.com/${REPO_OWNER}/${REPO_NAME}/ma
 
 WORK_DIR="$(mktemp -d)"
 CLONE_DIR="${WORK_DIR}/${REPO_NAME}"
-FINAL_DIR="${PWD}/${REPO_NAME}"
+DEST_DIR="${PWD}"
 
 # -----------------------------
 # HELP
@@ -90,19 +90,20 @@ remove_paths() {
 # -----------------------------
 
 log "Cloning repository into temp workspace..."
-git clone "$REPO_URL" "$CLONE_DIR"
+git clone --depth 1 "$REPO_URL" "$CLONE_DIR"
 
 cd "$CLONE_DIR"
 
 remove_paths
 
-log "Installing to final location..."
+# Drop the clone's git history so it is not copied into the destination.
+rm -rf "${CLONE_DIR}/.git"
 
-if [ -d "$FINAL_DIR" ]; then
-  echo "[error] Target already exists: $FINAL_DIR"
-  exit 1
-fi
+log "Installing into: $DEST_DIR"
 
-mv "$CLONE_DIR" "$FINAL_DIR"
+# Merge the cleaned contents (including dotfiles) into the current directory,
+# overlaying onto any existing folders. The -n flag skips files that already
+# exist, so nothing in the destination is overwritten. Temp is removed on exit.
+cp -Rn "${CLONE_DIR}/." "${DEST_DIR}/"
 
-log "Installation complete at: $FINAL_DIR"
+log "Installation complete at: $DEST_DIR"
