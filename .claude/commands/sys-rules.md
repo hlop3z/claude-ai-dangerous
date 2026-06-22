@@ -66,7 +66,7 @@ Before finalizing, for each critical concern that could be either hand-written o
 - **Research first.** Use web search to find the current, actively-maintained options — do not rely on memory; tooling moves.
 - **Discuss with the user.** Present the choice as **pure-language vs. tool**, offering **at most 3 options total**, each with a one-line trade-off, and **always end with a clear recommendation** (which one and why).
 - **Wait for the user's pick** before treating any specific tool as settled.
-- **Keep the written `rules.md` abstract.** The concrete tool names belong only in this chat discussion. The file records the *principle* (adopt mature components for critical concerns), never the vendor/library names chosen.
+- **Keep the written `rules.md` abstract.** The concrete tool names belong only in this chat discussion. The file records the _principle_ (adopt mature components for critical concerns), never the vendor/library names chosen.
 
 ---
 

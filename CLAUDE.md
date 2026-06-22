@@ -1,14 +1,15 @@
 # Project Rules (self-enforced)
 
-This project is governed by **3 rules across 4 files**, all in `docs-sys/`. Know them every session.
+This project is governed by **4 rules**. Rules 1–3 are abstract and language-agnostic, spread across 4 files in `docs-sys/`. Rule 4 is the concrete frontend state ruleset, living in `.claude/commands/`. Know them every session.
 
 | Rule                | File(s)                                            | Purpose                     |
 | ------------------- | -------------------------------------------------- | --------------------------- |
 | 1. What to build    | `docs-sys/rfc.md`                                  | The system's spec           |
 | 2. How to code      | `docs-sys/rules.md`                                | The coding ruleset          |
 | 3. What to remember | `docs-sys/ai_memory.md` + `docs-sys/ai_session.md` | Persistent + session memory |
+| 4. Frontend state   | `.claude/commands/sys-frontend.md`                 | The frontend state ruleset  |
 
-All four are single, abstract, programming-language-agnostic. Read the relevant ones before writing code and keep them in sync.
+Rules 1–3 are single, abstract, programming-language-agnostic. Read the relevant ones before writing code and keep them in sync.
 
 ---
 
@@ -47,9 +48,20 @@ A scratch tracker for the **current session only** — like cache memory of what
 - High-level-abstraction notes only; ephemeral, not committed.
 - Safe to clear/overwrite each session. Promote anything that proves durable into `ai_memory.md`.
 
+## Rule 4 — `.claude/commands/sys-frontend.md` — FRONTEND state model
+
+The single canonical frontend state ruleset. Unlike Rules 1–3, this one is **concrete and may name tools** — it is the deliberate exception to Rule 2's "adopt a mature external library for critical concerns": frontend state is **our own model**, a stable path-based reactive store contract.
+
+- Invoked/maintained via `/sys-frontend`. Read it before building any frontend state; the code MUST conform.
+- Prefer **`nanostores`** as the state model whenever it fits.
+- In **Preact / React**, use **signals** when `nanostores` is not a good fit.
+- The store's public contract is **stable** — depend on the surface, never internals; never introduce a competing state mechanism.
+
 ---
 
 ## Standing constraints
+
+These constraints govern **Rules 1–3** (the `docs-sys/` files). **Rule 4 is the deliberate exception**: it is concrete and may name tools (`nanostores`, signals).
 
 - **Single design** — `rfc.md` and `rules.md` each give one canonical answer, no alternatives.
 - **Abstract, not literal** — principles, contracts, intent, and associations; never implementation detail or code.
