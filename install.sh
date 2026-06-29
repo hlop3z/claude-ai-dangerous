@@ -13,7 +13,6 @@ REMOVE_PATHS="
 install.sh
 LICENSE
 README.md
-.notes/
 "
 
 # -----------------------------

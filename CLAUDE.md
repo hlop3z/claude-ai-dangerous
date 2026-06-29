@@ -32,3 +32,26 @@ discipline and a build-vs-adopt gate. Follow the pipeline — the rules apply th
 - **`openspec/guidelines.md`** — the full reference: build-vs-adopt hierarchy, maturity rubric, doc taxonomy.
 
 Commands stay thin and point at these, so a change costs few tokens to plan.
+
+## Keep the main thread cheap
+
+For broad or exploratory searches — locating code across many files, surveying naming
+conventions, answering a question that spans several files — delegate to the `Explore` or
+`general-purpose` subagent and keep only its conclusion. Don't read the file dumps into the
+main thread. For a single known file or symbol, just search directly (a subagent would cost
+more than it saves).
+
+## Where findings go (promote or discard — never accumulate)
+
+There is **no `/research` folder**. A global, ever-growing notes dump rots and starts
+misleading. Every durable finding gets exactly one canonical home; everything else dies in
+the scratchpad. When a subagent surfaces something worth keeping, route it:
+
+- **Throwaway exploration** → the session scratchpad. Auto-discarded; never committed.
+- **Derivable from code** → leave it in the code. Don't snapshot it.
+- **A decision + its why** (build-vs-adopt, tradeoffs) → `design.md` ADR block.
+- **Durable behavior contract** → `specs/` (synced to main specs on `/opsx:sync`).
+- **In-flight notes for a specific change** → `openspec/changes/<change>/`, archived on `/opsx:archive`.
+- **Non-derivable fact about the user/project** → the memory dir; update or delete when wrong.
+
+The discipline is promote-or-discard, not save-more: one home, one lifecycle, one owner.

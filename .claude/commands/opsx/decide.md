@@ -25,18 +25,22 @@ For each critical concern, walk the hierarchy `Rent > Adopt > Extend > Fork > Bu
    - **Wait for the user's pick** before treating any tool as settled. Status of each decision is `draft` until the user confirms, then `approved`. (No "rejected" state — an unpicked option is simply dropped.)
 
 4. **Record into `design.md`** — append/update a `## Decisions` section, one block per concern:
+
    ```markdown
    ### Decision: <concern> — <Adopt|Extend|Fork|Build> <tool-or-"hand-written">
+
    - **Status**: approved
    - **Why**: <one line>
    - **Considered**: <other 1–2 options, one line each>
    - **Isolation**: <the adapter/boundary the choice lives behind>
    ```
+
    Keep concrete tool names in `design.md` only — never push them into `config.yaml` or `specs/` (those stay abstract).
 
 5. **Summary** — list each concern → decision → status. Note any left in `draft` (awaiting the user).
 
 **Guardrails**
+
 - Research before recommending — current options, not remembered ones.
 - ≤3 options per concern, always with a recommendation.
 - Default toward Adopt/Extend; a `Build` decision needs an explicit one-line justification.
