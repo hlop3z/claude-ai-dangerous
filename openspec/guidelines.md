@@ -55,6 +55,53 @@ Evaluate **lifecycle** cost (integration, upgrades, patching, ops), not just fir
 - Composable core; every surface is a thin adapter (no logic, no state).
 - Dependencies point **inward**: adapters → application → domain core. Core runs with no surface present.
 
+## Externalize native-format content (data is not code)
+
+Content that has its own format and tooling lives in a file of that format — never
+embedded as a string literal in source. The code references or loads it; it does not
+inline it.
+
+Applies to: SQL/migrations, schema DDL, YAML/TOML/JSON/`.env` config, HTML/email/report
+templates, GraphQL/Protobuf/OpenAPI schemas, prompt templates, CSS, regex catalogs, and
+any multi-line literal that is really data with a grammar.
+
+- **Why** — native files get syntax highlighting, linting, formatting, diffs, and
+  validation in CI; embedding them as strings hides the data from every one of those
+  tools and mixes the DO layer (logic) with content that is really a contract.
+- **Keep the native extension** (`.sql`, `.yaml`, `.toml`, `.html`, `.graphql`) so
+  editors and CI recognize it. Load it via the format's mature parser/loader — per the
+  build-vs-adopt hierarchy, don't hand-roll parsing of a standard format.
+- **Loading is an adapter concern.** Read at runtime, or embed at build time (e.g. a
+  compile-time include), behind a loader in the adapter layer — never reach into files
+  from the core.
+- **Exception** — short, one-line literals that are not independently meaningful (a
+  single key, a format string, a trivial query) stay inline. The line is whether the
+  content has its own grammar/tooling or is large enough to be data, not code.
+
+## Single source of truth for values
+
+Every value is defined once and referenced — never duplicated as a magic literal. Where
+the one definition lives depends on what the value is:
+
+- **Constants** (domain invariants fixed at build time — limits, status codes, keys,
+  defaults) live **next to the concept that owns them** in the core, exported for reuse.
+  Locality over a global bucket: a `constants` god-module that collects unrelated values
+  couples every caller to it and rots — split by owning concept instead.
+- **Config** (runtime- or environment-tunable values — URLs, timeouts, feature flags) is
+  **centralized in one external native-format file** (see _Externalize native-format
+  content_) and read through a single config adapter. The core receives typed, validated
+  values — never raw `env`/file lookups scattered through the code.
+- **Secrets are not config.** Committed config files hold non-secret values only. Secrets
+  (keys, tokens, passwords, connection strings) are injected at runtime from the
+  environment or a secret manager, referenced by key, and **never written to source or
+  VCS** — not even in an example file with a real value. The config adapter resolves them;
+  the core only ever sees the resolved value.
+- **No magic literals** in logic or tasks. A bare number or string with meaning gets a
+  named definition at its canonical home; repetition of the same literal is a defect.
+
+The test: changing a value should mean editing exactly one place, and that place should
+be the one an owner would look first.
+
 ## Document taxonomy
 
 Map docs to a canonical type — don't invent categories:
