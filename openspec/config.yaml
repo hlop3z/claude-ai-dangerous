@@ -66,4 +66,4 @@ rules:
     - No business logic, branching, or state outside the core.
     - Keep templates/migrations/config/schemas in external native-format files; load, don't inline.
     - Define each value once: constants beside their owning concept, tunable config centralized
-      behind a config adapter. No magic literals, no duplicated values. See guidelines.md.
+        behind a config adapter. No magic literals, no duplicated values. See guidelines.md.
