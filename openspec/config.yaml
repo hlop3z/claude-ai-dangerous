@@ -31,6 +31,8 @@ context: |
   Adopt before build: for any critical concern (correctness-, security-, or
   reliability-sensitive), prefer the hierarchy Rent infra > Adopt OSS > Extend > Fork >
   Build. Self-writing a critical concern is a defect unless no mature option exists.
+  Some concerns are never hand-rolled — security/authz/crypto and observability/telemetry
+  always adopt a mature standard (e.g. OpenTelemetry); domain models stay tool-agnostic.
   Record each such choice with /opsx:decide. See openspec/guidelines.md.
 
   Document naming: map every doc to a canonical type (RFC, ADR, ADD, TDD, Runbook…).

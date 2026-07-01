@@ -1,8 +1,8 @@
 ---
-name: "SYS: Handoff"
+name: "AI: Handoff"
 description: "Generate a HANDOFF.md snapshot of session state for cross-session continuity"
-category: System
-tags: [system, session, handoff, continuity]
+category: AI
+tags: [ai, session, handoff, continuity]
 ---
 
 Generate a `HANDOFF.md` at the project root that snapshots the current session so a future
