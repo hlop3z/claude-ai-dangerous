@@ -88,6 +88,14 @@ Telemetry is an **adapter concern**. Application code emits signals through the 
 - Composable core; every surface is a thin adapter (no logic, no state).
 - Dependencies point **inward**: adapters → application → domain core. Core runs with no surface present.
 
+## File size guidelines
+
+A file's line count is a proxy for whether it holds a single clear responsibility. Treat these as review thresholds, not hard limits:
+
+- **< 300 LOC** — Excellent. Clear, focused, and easy for humans and AI to understand.
+- **300–600 LOC** — Generally acceptable. Ensure the file still has a single clear responsibility.
+- **> 600 LOC** — Review required. Prefer splitting into smaller modules unless there is a strong reason to keep it together.
+
 ## Externalize native-format content (data is not code)
 
 Content that has its own format and tooling lives in a file of that format — never
