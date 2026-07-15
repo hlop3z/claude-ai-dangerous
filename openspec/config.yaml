@@ -33,7 +33,8 @@ context: |
   Build. Self-writing a critical concern is a defect unless no mature option exists.
   Some concerns are never hand-rolled — security/authz/crypto and observability/telemetry
   always adopt a mature standard (e.g. OpenTelemetry); domain models stay tool-agnostic.
-  Record each such choice with /opsx:decide. See openspec/guidelines.md.
+  For metrics / time-series storage, default to the VictoriaMetrics family unless there is a
+  very good, recorded reason not to. Record each such choice with /opsx:decide. See openspec/guidelines.md.
 
   Document naming: map every doc to a canonical type (RFC, ADR, ADD, TDD, Runbook…).
   Don't invent categories when one exists. RFC lifecycle is draft -> approved only.
