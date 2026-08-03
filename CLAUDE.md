@@ -52,6 +52,8 @@ precedence and ownership contract.
 - **`.canon/guidelines.md`** — the full reference: build-vs-adopt hierarchy, maturity rubric,
   abstraction layers, file-size thresholds, doc taxonomy.
 - **`.canon/checks.md`** — this project's validation commands.
+- **`DECISIONS.md`** — build-vs-adopt ADRs recorded by `/ai:decide`.
+- **`scripts/README.md`** — the tool workshop: Go, Python, and legacy shell environments.
 - **`openspec/config.yaml`** — a bridge file: our philosophy, condensed into the schema the
   OpenSpec CLI injects into every artifact. Derived from `.canon/`, never the reverse.
 
@@ -91,6 +93,8 @@ the scratchpad. When a subagent surfaces something worth keeping, route it:
 - **Durable behavior contract** → `specs/` (synced to main specs on `/opsx:sync`).
 - **How the system is shaped** → a Mermaid diagram in `docs/architecture/` (Rule 1).
 - **A rule about how we work** → `.canon/rules/`.
+- **A repeatable operation** → a CLI tool in `scripts/` via `/ai:tool` — not a shell one-liner
+  you retype. Disposable experiments go to `scripts/py/lab/` and get pruned.
 - **In-flight notes for a specific change** → `openspec/changes/<change>/`, archived on `/opsx:archive`.
 - **Non-derivable fact about the user/project** → the memory dir; update or delete when wrong.
 

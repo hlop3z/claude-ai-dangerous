@@ -24,6 +24,8 @@ so `git diff` shows exactly what changed and `git checkout` undoes it.
 | ---------------------- | -------- | --------------------------------------------------------- |
 | `.canon/`              | yours    | The engineering rules. No external tool writes here.      |
 | `CLAUDE.md`            | yours    | Always-loaded index: pipeline, precedence, rule triggers. |
+| `DECISIONS.md`         | yours    | Build-vs-adopt ADRs recorded by `/ai:decide`.             |
+| `scripts/`             | yours    | Tool workshop: Go + Python CLI environments (`/ai:tool`). |
 | `.claude/commands/ai/` | yours    | Custom commands. Work with or without OpenSpec installed. |
 | `openspec/config.yaml` | bridge   | Our content, OpenSpec's schema. Re-derive from `.canon/`. |
 | `openspec/`, `opsx/`   | upstream | Vendored from the OpenSpec CLI. Regenerable, expendable.  |
