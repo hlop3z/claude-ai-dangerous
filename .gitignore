@@ -280,3 +280,6 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 # ============================================
 .ai_notes/
 
+# Session snapshot written by /ai:handoff — a private resume note, never canonical.
+HANDOFF.md
+
