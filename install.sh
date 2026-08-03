@@ -28,6 +28,7 @@ MANAGED_PATHS="
 SEEDED_PATHS="
 CLAUDE.md
 .canon/checks.md
+DECISIONS.md
 openspec/config.yaml
 .claude/settings.json
 .mcp.json
