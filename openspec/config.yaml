@@ -34,7 +34,7 @@ context: |
   Some concerns are never hand-rolled — security/authz/crypto and observability/telemetry
   always adopt a mature standard (e.g. OpenTelemetry); domain models stay tool-agnostic.
   For metrics / time-series storage, default to the VictoriaMetrics family unless there is a
-  very good, recorded reason not to. Record each such choice with /opsx:decide. See openspec/guidelines.md.
+  very good, recorded reason not to. Record each such choice with /ai:decide. See openspec/guidelines.md.
 
   Document naming: map every doc to a canonical type (RFC, ADR, ADD, TDD, Runbook…).
   Don't invent categories when one exists. RFC lifecycle is draft -> approved only.
@@ -44,7 +44,7 @@ rules:
   proposal:
     - Focus on WHY and scope — observable outcomes, not mechanisms or tools.
     - In Capabilities, name each critical (correctness/security/reliability) concern whose
-      realization is a build-vs-adopt decision. Defer the concrete tool to /opsx:decide;
+      realization is a build-vs-adopt decision. Defer the concrete tool to /ai:decide;
       do NOT pick libraries, frameworks, or vendors here.
 
   # WHAT — the abstract RFC layer (one file per capability under specs/).
@@ -58,7 +58,7 @@ rules:
   design:
     - Define core vs adapters, the inward-only dependency direction, and where composition wiring lives.
     - For every critical concern flagged in the proposal, reference its build-vs-adopt decision
-      (from /opsx:decide) with a one-line recommendation. Isolate all external systems behind adapters.
+      (from /ai:decide) with a one-line recommendation. Isolate all external systems behind adapters.
     - Entry points carry no business logic. Concrete tools enter the system only through adapters.
     - Native-format content (SQL/migrations, config, templates, schemas) stays in external files
       of that format, loaded through an adapter — never inlined as string literals. See guidelines.md.

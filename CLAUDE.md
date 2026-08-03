@@ -8,7 +8,7 @@ discipline and a build-vs-adopt gate. Follow the pipeline — the rules apply th
       ↓
 /opsx:propose   Generate proposal.md (WHY/scope) + specs (abstract WHAT) + design.md (HOW).
       ↓
-/opsx:decide    Build-vs-adopt gate: per critical concern, Rent>Adopt>Extend>Fork>Build.
+/ai:decide      Build-vs-adopt gate: per critical concern, Rent>Adopt>Extend>Fork>Build.
       ↓             Records each decision into design.md. Run before implementing.
 /opsx:apply     Implement the tasks. Thin entry points; adapters isolate every dependency.
       ↓
@@ -24,7 +24,7 @@ discipline and a build-vs-adopt gate. Follow the pipeline — the rules apply th
    No layer leaks into another. Core holds behavior; every surface (CLI/GUI/API) is a thin adapter.
 
 2. **Adopt before you build.** For anything correctness-, security-, or reliability-critical,
-   prefer a mature tool over hand-writing it. `/opsx:decide` makes that call explicit and records it.
+   prefer a mature tool over hand-writing it. `/ai:decide` makes that call explicit and records it.
 
 ## Where the rules live (don't restate them)
 
@@ -32,6 +32,19 @@ discipline and a build-vs-adopt gate. Follow the pipeline — the rules apply th
 - **`openspec/guidelines.md`** — the full reference: build-vs-adopt hierarchy, maturity rubric, doc taxonomy.
 
 Commands stay thin and point at these, so a change costs few tokens to plan.
+
+## Command ownership (`ai:` is ours, `opsx:` is upstream)
+
+- **`.claude/commands/opsx/`** — vendored from the OpenSpec CLI. Treat as **regenerable**: an
+  `openspec` upgrade may overwrite it, so any edit there is expendable and must never be the
+  only home of a rule.
+- **`.claude/commands/ai/`** — **ours**. Anything we author lives here, survives an OpenSpec
+  upgrade or removal, and must degrade gracefully when OpenSpec is absent (detect the CLI, fall
+  back to on-disk paths, then to `PROJECT.md` / a plain file). No `ai:` command may hard-fail
+  because `openspec` isn't installed.
+
+New custom command → `ai/`. If a rule matters, its canonical home is `CLAUDE.md`,
+`openspec/config.yaml`, `openspec/guidelines.md`, or an `ai/` command — never an `opsx/` file.
 
 ## Commit & branch workflow
 

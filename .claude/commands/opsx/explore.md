@@ -42,7 +42,7 @@ When the user brings something meaty, decompose before converging — non-bindin
 - **Unknowns** — what's missing or assumed, and what would resolve it.
 - **Strategies (≥3)** — distinct candidate approaches, each with its trade-offs. Then a recommendation, explicitly non-binding.
 
-Stay at the WHAT level here — name critical concerns (correctness/security/reliability) abstractly; the build-vs-adopt tool choice is deferred to `/opsx:decide`, not made now. This is a possibility map, not a commitment.
+Stay at the WHAT level here — name critical concerns (correctness/security/reliability) abstractly; the build-vs-adopt tool choice is deferred to `/ai:decide`, not made now. This is a possibility map, not a commitment.
 
 ---
 
