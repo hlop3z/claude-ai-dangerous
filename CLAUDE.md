@@ -1,7 +1,7 @@
 # How to develop here
 
-This project drives all work through **OpenSpec**, augmented with an abstraction-layer
-discipline and a build-vs-adopt gate. Follow the pipeline — the rules apply themselves.
+This project drives all work through **OpenSpec**, governed by a canon of engineering rules
+that is ours and comes first. Follow the pipeline — the rules apply themselves.
 
 ```
 /opsx:explore   Think it through. Decompose (invariants, boundaries, ≥3 strategies). No code.
@@ -17,42 +17,59 @@ discipline and a build-vs-adopt gate. Follow the pipeline — the rules apply th
 /opsx:archive   Close out the completed change.
 ```
 
+## The canon comes first
+
+`.canon/` holds the rules this project lives by. It is **ours** — no external tool writes
+there. When an opsx command's instructions conflict with a rule in `.canon/`, the rule wins;
+say so rather than silently following the command. See `.canon/README.md` for the full
+precedence and ownership contract.
+
+## The rules (open the file when the trigger fires)
+
+| #                                    | Trigger                              | In one line                                                                       |
+| ------------------------------------ | ------------------------------------ | --------------------------------------------------------------------------------- |
+| [1](.canon/rules/01-diagrams.md)     | explaining or changing architecture  | Draw it in Mermaid, in `docs/architecture/`, describing what _is_.                |
+| [2](.canon/rules/02-architecture.md) | code touching any external system    | Pure core, ports and adapters at the boundary; dependencies point inward.         |
+| [3](.canon/rules/03-commits.md)      | finishing any multi-file task        | Review the diff, split by intent, Conventional Commits, never co-author.          |
+| [4](.canon/rules/04-merges.md)       | any branch merge                     | A clean merge is not a correct one — you are the reviewer.                        |
+| [5](.canon/rules/05-cleanup.md)      | a merge just landed                  | Delete what the merge superseded; git history is the history.                     |
+| [6](.canon/rules/06-validation.md)   | about to claim something is done     | Run the checks in `.canon/checks.md`; report what you couldn't run as unverified. |
+| [7](.canon/rules/07-coherence.md)    | code sits beside an existing pattern | Coherence beats minimal diff; consolidate duplicates, flag out-of-scope mess.     |
+| [8](.canon/rules/08-docs.md)         | architecture or API changed          | Docs that contradict the code are defects — same change set, not later.           |
+
 ## The two ideas that make this work
 
 1. **Abstraction layers stay separate.** WHAT (`specs/`) is language-agnostic behavior.
    HOW (`design.md`) is structure + tool choices. DO (`tasks.md` + code) is the implementation.
-   No layer leaks into another. Core holds behavior; every surface (CLI/GUI/API) is a thin adapter.
+   No layer leaks into another. Core holds behavior; every surface is a thin adapter (Rule 2).
 
 2. **Adopt before you build.** For anything correctness-, security-, or reliability-critical,
    prefer a mature tool over hand-writing it. `/ai:decide` makes that call explicit and records it.
 
 ## Where the rules live (don't restate them)
 
-- **`openspec/config.yaml`** — the philosophy, injected once into every artifact by the CLI.
-- **`openspec/guidelines.md`** — the full reference: build-vs-adopt hierarchy, maturity rubric, doc taxonomy.
+- **`.canon/rules/`** — the canon above. Imperative, trigger-based.
+- **`.canon/guidelines.md`** — the full reference: build-vs-adopt hierarchy, maturity rubric,
+  abstraction layers, file-size thresholds, doc taxonomy.
+- **`.canon/checks.md`** — this project's validation commands.
+- **`openspec/config.yaml`** — a bridge file: our philosophy, condensed into the schema the
+  OpenSpec CLI injects into every artifact. Derived from `.canon/`, never the reverse.
 
 Commands stay thin and point at these, so a change costs few tokens to plan.
 
-## Command ownership (`ai:` is ours, `opsx:` is upstream)
+## File ownership (`.canon/` and `ai:` are ours, `opsx:` is upstream)
 
-- **`.claude/commands/opsx/`** — vendored from the OpenSpec CLI. Treat as **regenerable**: an
-  `openspec` upgrade may overwrite it, so any edit there is expendable and must never be the
-  only home of a rule.
-- **`.claude/commands/ai/`** — **ours**. Anything we author lives here, survives an OpenSpec
-  upgrade or removal, and must degrade gracefully when OpenSpec is absent (detect the CLI, fall
-  back to on-disk paths, then to `PROJECT.md` / a plain file). No `ai:` command may hard-fail
-  because `openspec` isn't installed.
+- **`.canon/`** — ours. The canon. No external tool may write here.
+- **`.claude/commands/ai/`** — ours. Lives under `.claude/` only because the harness requires
+  that location. Must degrade gracefully when OpenSpec is absent — no `ai:` command may
+  hard-fail because `openspec` isn't installed.
+- **`openspec/config.yaml`** — bridge: content ours, location and schema theirs. If a reinstall
+  overwrites it, re-derive from `.canon/`.
+- **`.claude/commands/opsx/`** and the rest of `openspec/` — vendored from the OpenSpec CLI.
+  **Regenerable**: an upgrade may overwrite them, so any edit there is expendable and must
+  never be a rule's only home.
 
-New custom command → `ai/`. If a rule matters, its canonical home is `CLAUDE.md`,
-`openspec/config.yaml`, `openspec/guidelines.md`, or an `ai/` command — never an `opsx/` file.
-
-## Commit & branch workflow
-
-Do the whole cycle from here — the user tracks progress through branches, not by running git.
-
-- **Order per change:** run `/opsx:apply` → **commit** the implementation → `/opsx:sync` → `/opsx:archive` → **commit** the sync/archive delta → **merge the branch into `main`**. Work happens on a per-change branch so each change is trackable; fold it into `main` only after archive.
-- **NEVER co-author.** Commits carry the user's account only. Do **not** add `Co-Authored-By:` trailers, a `🤖 Generated with Claude Code` line, or any other attribution — not for commits, not for merges, not for PR bodies. Author = the user, full stop.
-- Keep commit messages plain and about the change itself.
+New custom command → `.claude/commands/ai/`. New rule → `.canon/rules/`.
 
 ## Keep the main thread cheap
 
@@ -72,6 +89,8 @@ the scratchpad. When a subagent surfaces something worth keeping, route it:
 - **Derivable from code** → leave it in the code. Don't snapshot it.
 - **A decision + its why** (build-vs-adopt, tradeoffs) → `design.md` ADR block.
 - **Durable behavior contract** → `specs/` (synced to main specs on `/opsx:sync`).
+- **How the system is shaped** → a Mermaid diagram in `docs/architecture/` (Rule 1).
+- **A rule about how we work** → `.canon/rules/`.
 - **In-flight notes for a specific change** → `openspec/changes/<change>/`, archived on `/opsx:archive`.
 - **Non-derivable fact about the user/project** → the memory dir; update or delete when wrong.
 
