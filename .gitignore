@@ -272,6 +272,9 @@ report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 *.lib
 *.obj
 *.mod
+# ...but go.mod is source, not a Fortran build artifact. Without this exception
+# a fresh clone gets a Go workspace with no module file and cannot build.
+!go.mod
 *.sum~
 *.wasm
 
