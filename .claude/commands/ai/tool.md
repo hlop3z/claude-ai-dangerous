@@ -23,10 +23,18 @@ The right answer depends on **this** project, not on a default. Establish, in or
 1. **Does a tool already exist for this?** Check `scripts/go/cmd/`, `scripts/py/tools/`,
    `scripts/py/lab/`, and `scripts/sh/`. If something close exists, **extend it** rather than
    adding a near-duplicate (Rule 7). Two tools solving one problem is the failure mode here.
-2. **Does a mature CLI already solve this?** The canon's adopt-before-build hierarchy applies
-   to tools too. `ripgrep`, `jq`, `fd`, `curl` exist — don't rebuild them. Build when the job
-   is *this project's* specific composition of steps, not a commodity operation. When the call
-   is close, run `/ai:decide` and record it.
+2. **Does a mature CLI already solve this? — HARD GATE.** **Search the web before writing a
+   line.** Do not answer this from memory: you will not remember the tool that already exists,
+   and "I didn't know of one" is not the same as "there isn't one". `ripgrep`, `jq`, `fd`,
+   `tokei`, `scc`, `curl`, `hyperfine`, `dust` and hundreds more exist — rebuilding any of
+   them is a defect, not a shortcut.
+
+   Build only when the job is *this project's* specific composition of steps, not a commodity
+   operation. If a mature tool exists, the work is to **adopt** it: add it to
+   `scripts/go/cmd/ensure` so it installs on any machine, and record the choice in
+   `DECISIONS.md`. "It isn't installed here" is never a reason to reimplement something.
+
+   When the call is close, run `/ai:decide` and record it.
 3. **What does the project already use?** A repo that is mostly Go should not grow a Python
    tool for a job Go handles fine, and vice versa. Existing language, existing dependencies,
    and what the team already maintains all outweigh a marginal technical preference.
@@ -84,7 +92,7 @@ One `main.go` per tool, cobra for the interface, shared helpers in `internal/`.
 ```bash
 cd scripts/go
 mkdir -p cmd/<name>
-# write cmd/<name>/main.go using cobra (see cmd/loc for the reference shape)
+# write cmd/<name>/main.go using cobra (see cmd/ensure for the reference shape)
 go mod tidy && go build -o bin/ ./... && go vet ./...
 ```
 
@@ -163,7 +171,10 @@ is the same promote-or-discard rule that governs `.canon/`.
 ## Guardrails
 
 - Never scaffold before Step 1. Duplicating an existing tool is the main failure mode.
-- Don't rebuild a commodity CLI that already exists — adopt it.
+- **Never reinvent the wheel.** Search first, every time. This repo has already lost a day to
+  a hand-written line-counter that `tokei` and `scc` both already did better — see
+  `DECISIONS.md`. Adopting and wiring the tool into `cmd/ensure` is nearly always the smaller
+  job than building, and it is always the more correct one.
 - Disposable by default; reusable is earned.
 - A tool with no clear one-sentence job doesn't get built. Ask instead.
 - Lab scripts are single files with inline deps. The moment one needs a package layout, it is

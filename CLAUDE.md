@@ -43,8 +43,15 @@ precedence and ownership contract.
    HOW (`design.md`) is structure + tool choices. DO (`tasks.md` + code) is the implementation.
    No layer leaks into another. Core holds behavior; every surface is a thin adapter (Rule 2).
 
-2. **Adopt before you build.** For anything correctness-, security-, or reliability-critical,
-   prefer a mature tool over hand-writing it. `/ai:decide` makes that call explicit and records it.
+2. **Never reinvent the wheel.** If a mature tool already does the job, adopt it — do not
+   write your own. This applies to whole CLIs, not just libraries: before building anything,
+   search for what already exists. `/ai:decide` makes the call explicit and records it, and
+   `scripts/go/cmd/ensure` installs an adopted tool so "it isn't installed" is never the
+   reason to rebuild it.
+
+   > This rule has already been violated once in this repo: a `loc` line-counter was written
+   > from scratch when `tokei` and `scc` both existed. It was deleted and replaced. Searching
+   > first costs a minute; the rebuild cost a day and shipped a bug the mature tool never had.
 
 ## Where the rules live (don't restate them)
 

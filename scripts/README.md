@@ -30,7 +30,7 @@ gets deleted.
 ```bash
 # Go
 cd scripts/go && go build -o bin/ ./...      # binaries land in bin/ (gitignored)
-cd scripts/go && go run ./cmd/loc --min 300  # or run directly
+cd scripts/go && go run ./cmd/ensure tokei   # or run directly
 
 # Python — reusable
 cd scripts/py && uv sync --all-packages      # --all-packages: root sync alone skips members
@@ -42,8 +42,21 @@ uv run scripts/py/lab/<name>.py              # inline deps, ephemeral env, no lo
 
 ## What's here now
 
-| Tool                    | Language | Job                                                                           |
-| ----------------------- | -------- | ----------------------------------------------------------------------------- |
-| `go/cmd/loc`            | Go       | Report source files by line count vs the thresholds in `.canon/guidelines.md` |
-| `py/tools/mdlinks`      | Python   | Find broken relative links in Markdown                                        |
-| `sh/format_markdown.sh` | sh       | Prettier over all Markdown — port candidate                                   |
+| Tool                    | Language | Job                                                    |
+| ----------------------- | -------- | ------------------------------------------------------ |
+| `go/cmd/ensure`         | Go       | Install an adopted third-party CLI (currently `tokei`) |
+| `py/tools/mdlinks`      | Python   | Find broken relative links in Markdown                 |
+| `sh/format_markdown.sh` | sh       | Prettier over all Markdown — port candidate            |
+
+## Adopted tools
+
+Not everything in the workshop is written here. Counting lines of code is
+[tokei](https://github.com/XAMPPRocky/tokei), adopted rather than built:
+
+```bash
+cd scripts/go && go run ./cmd/ensure tokei   # installs it if missing
+tokei . --files --sort lines                 # the file-size review in .canon/checks.md
+```
+
+Before building any tool, check whether a mature one already exists — `/ai:tool` makes that a
+hard gate, and `cmd/ensure` is where an adopted tool gets wired in so it is always available.
