@@ -1,6 +1,8 @@
 # Engineering Guidelines
 
-The distilled reference behind `config.yaml`. Commands point here; they don't restate it.
+The reference the canon cites. `.canon/rules/` says what to do and when; this file holds the
+hierarchies, rubrics, and tables those rules lean on. `openspec/config.yaml` is a condensed
+projection of both. Commands point here — they don't restate it.
 
 ## Build-vs-adopt hierarchy (EDF)
 
@@ -87,8 +89,9 @@ Telemetry is an **adapter concern**. Application code emits signals through the 
 | DO    | `tasks.md` + code     | the pinned implementation                                  | new rules or scope    |
 
 - One canonical design — decide, don't list variants.
-- Composable core; every surface is a thin adapter (no logic, no state).
-- Dependencies point **inward**: adapters → application → domain core. Core runs with no surface present.
+
+This axis is about **artifacts**. The structural axis — pure core, ports and adapters,
+inward-only dependencies — is **Rule 2** (`.canon/rules/02-architecture.md`).
 
 ## File size guidelines
 

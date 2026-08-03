@@ -2,9 +2,12 @@ schema: spec-driven
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Project philosophy — injected once into every artifact's instructions.
-# This is the single source of truth for HOW we think. Commands stay thin and
-# point here instead of restating it (keeps Claude's token use low).
-# Full reference: openspec/guidelines.md
+#
+# BRIDGE FILE. The content is ours; the location and schema belong to the OpenSpec
+# CLI. The canon in .canon/ is the source of truth — this is a condensed projection
+# of it, kept here only because the CLI reads this path. If an OpenSpec reinstall
+# overwrites this file, re-derive it from .canon/ — never edit .canon/ to match it.
+# Full reference: .canon/guidelines.md and .canon/rules/
 # ─────────────────────────────────────────────────────────────────────────────
 
 context: |
@@ -21,12 +24,12 @@ context: |
   Data is not code: content with its own format (SQL/migrations, YAML/TOML/JSON config,
   HTML/templates, schemas, prompts) lives in a file of that format with its native
   extension and is loaded via an adapter — never embedded as a string literal in code.
-  See openspec/guidelines.md.
+  See .canon/guidelines.md.
 
   Single source of truth: every value is defined once and referenced, never duplicated as
   a magic literal. Constants live next to the concept that owns them (no god-module);
   tunable config is centralized in one external file behind a config adapter. Secrets are
-  not config — injected at runtime, referenced by key, never committed. See guidelines.md.
+  not config — injected at runtime, referenced by key, never committed. See .canon/guidelines.md.
 
   Adopt before build: for any critical concern (correctness-, security-, or
   reliability-sensitive), prefer the hierarchy Rent infra > Adopt OSS > Extend > Fork >
@@ -34,7 +37,7 @@ context: |
   Some concerns are never hand-rolled — security/authz/crypto and observability/telemetry
   always adopt a mature standard (e.g. OpenTelemetry); domain models stay tool-agnostic.
   For metrics / time-series storage, default to the VictoriaMetrics family unless there is a
-  very good, recorded reason not to. Record each such choice with /ai:decide. See openspec/guidelines.md.
+  very good, recorded reason not to. Record each such choice with /ai:decide. See .canon/guidelines.md.
 
   Document naming: map every doc to a canonical type (RFC, ADR, ADD, TDD, Runbook…).
   Don't invent categories when one exists. RFC lifecycle is draft -> approved only.
@@ -61,7 +64,7 @@ rules:
       (from /ai:decide) with a one-line recommendation. Isolate all external systems behind adapters.
     - Entry points carry no business logic. Concrete tools enter the system only through adapters.
     - Native-format content (SQL/migrations, config, templates, schemas) stays in external files
-      of that format, loaded through an adapter — never inlined as string literals. See guidelines.md.
+      of that format, loaded through an adapter — never inlined as string literals. See .canon/guidelines.md.
 
   # DO — implementation steps.
   tasks:
@@ -69,4 +72,4 @@ rules:
     - No business logic, branching, or state outside the core.
     - Keep templates/migrations/config/schemas in external native-format files; load, don't inline.
     - Define each value once: constants beside their owning concept, tunable config centralized
-        behind a config adapter. No magic literals, no duplicated values. See guidelines.md.
+        behind a config adapter. No magic literals, no duplicated values. See .canon/guidelines.md.

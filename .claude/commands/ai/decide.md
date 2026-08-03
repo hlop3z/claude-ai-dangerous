@@ -13,8 +13,8 @@ something a mature tool already does well is the failure this gate prevents.
 
 **This command is self-contained.** It works inside the OpenSpec pipeline when OpenSpec is
 present, and equally well without it — the hierarchy and rubric below are the authority, not a
-pointer into `openspec/`. If `openspec/guidelines.md` exists it is the fuller reference and
-wins on any detail; if it doesn't, nothing here degrades.
+pointer into `openspec/`. If `.canon/guidelines.md` exists it is the fuller reference and wins
+on any detail; if it doesn't, nothing here degrades.
 
 **Input**: Optionally a scope name (e.g. `/ai:decide add-auth`) — an OpenSpec change name, a
 feature name, or nothing. If omitted, infer from context; if ambiguous, ask via
@@ -24,12 +24,12 @@ feature name, or nothing. If omitted, infer from context; if ambiguous, ask via
 
 1. **Resolve where the decision gets recorded** — take the first that applies:
 
-   | Condition                                                 | Target                                                                                |
-   | --------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+   | Condition                                                 | Target                                                                                 |
+   | --------------------------------------------------------- | -------------------------------------------------------------------------------------- |
    | `openspec` CLI available **and** an active change matches | `openspec status --change "<name>" --json` → `artifactPaths.design.resolvedOutputPath` |
-   | `openspec/changes/<scope>/design.md` exists on disk       | that file                                                                             |
-   | `PROJECT.md` exists (post-`/ai:migration`)                | its `## Decisions (ADRs)` section                                                     |
-   | none of the above                                         | ask the user; default `DECISIONS.md` at the project root                              |
+   | `openspec/changes/<scope>/design.md` exists on disk       | that file                                                                              |
+   | `PROJECT.md` exists (post-`/ai:migration`)                | its `## Decisions (ADRs)` section                                                      |
+   | none of the above                                         | ask the user; default `DECISIONS.md` at the project root                               |
 
    Read whatever context exists for the scope (proposal, specs, design, or the surrounding
    code) before deciding. If the CLI reports `actionContext.mode: workspace-planning`, STOP —
