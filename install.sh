@@ -18,13 +18,16 @@ README.md
 
 # Template-owned. Overwritten by --update; the template is the source of truth.
 MANAGED_PATHS="
+.canon/rules
+.canon/guidelines.md
+.canon/README.md
 .claude/commands
-openspec/guidelines.md
 "
 
 # Seeded once, then yours. Never overwritten — --update only reports drift.
 SEEDED_PATHS="
 CLAUDE.md
+.canon/checks.md
 openspec/config.yaml
 .claude/settings.json
 .mcp.json
