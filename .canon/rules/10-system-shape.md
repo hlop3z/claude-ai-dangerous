@@ -22,9 +22,10 @@ to keep the monolith modular:
 ## Kernel/runtime
 
 The core engine provides the execution model — composition root, lifecycle, event
-dispatch, configuration. Applications and services are modules registered on it. The kernel
-knows no domain; contexts know no infrastructure (Rule 2's dependency direction, applied at
-system scale).
+dispatch, configuration, and the **object registry** (Rule 11) through which every scalar,
+model, and event is named, discovered, and resolved. Applications and services are modules
+registered on it. The kernel knows no domain; contexts know no infrastructure (Rule 2's
+dependency direction, applied at system scale).
 
 ## Domain model: DDD
 

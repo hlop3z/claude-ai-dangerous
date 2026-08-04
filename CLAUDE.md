@@ -38,6 +38,7 @@ precedence and ownership contract.
 | [8](.canon/rules/08-docs.md)         | architecture or API changed          | Docs that contradict the code are defects — same change set, not later.           |
 | [9](.canon/rules/09-standards.md)    | defining schemas, IDs, vocabularies  | Adopt the global standard: JSON Schema/OpenAPI/AsyncAPI; Wikidata/DOI/ORCID/LEI + UUID; Schema.org/RDF/ISO. |
 | [10](.canon/rules/10-system-shape.md) | starting a system or bounded context | Modular monolith on a kernel by default; DDD contexts, events between them, reads split from writes. |
+| [11](.canon/rules/11-object-registry.md) | naming or registering system objects | One grammar — `kind:namespace.object_name`, lowercase snake_case — in one kernel registry that every projection derives from. |
 
 ## The two ideas that make this work
 

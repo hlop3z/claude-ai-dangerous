@@ -49,6 +49,12 @@ context: |
   separation always, full CQRS or event sourcing only where the domain warrants it.
   Microservices only when explicitly requested. See .canon/rules/10-system-shape.md.
 
+  Object identity: every system object is named kind:namespace.object_name in lowercase
+  snake_case (scalar:core.int64, model:blog.post, event:commerce.order_created — events are
+  noun_verb past tense) and lives in the kernel's single registry, from which schemas, APIs,
+  validation, permissions, and docs are all projected. Scalars map 1:1 to JSON Schema /
+  OpenAPI types. See .canon/rules/11-object-registry.md.
+
   Document naming: map every doc to a canonical type (RFC, ADR, ADD, TDD, Runbook…).
   Don't invent categories when one exists. RFC lifecycle is draft -> approved only.
 
