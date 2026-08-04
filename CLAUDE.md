@@ -36,6 +36,8 @@ precedence and ownership contract.
 | [6](.canon/rules/06-validation.md)   | about to claim something is done     | Run the checks in `.canon/checks.md`; report what you couldn't run as unverified. |
 | [7](.canon/rules/07-coherence.md)    | code sits beside an existing pattern | Coherence beats minimal diff; consolidate duplicates, flag out-of-scope mess.     |
 | [8](.canon/rules/08-docs.md)         | architecture or API changed          | Docs that contradict the code are defects — same change set, not later.           |
+| [9](.canon/rules/09-standards.md)    | defining schemas, IDs, vocabularies  | Adopt the global standard: JSON Schema/OpenAPI/AsyncAPI; Wikidata/DOI/ORCID/LEI + UUID; Schema.org/RDF/ISO. |
+| [10](.canon/rules/10-system-shape.md) | starting a system or bounded context | Modular monolith on a kernel by default; DDD contexts, events between them, reads split from writes. |
 
 ## The two ideas that make this work
 

@@ -39,6 +39,16 @@ context: |
   For metrics / time-series storage, default to the VictoriaMetrics family unless there is a
   very good, recorded reason not to. Record each such choice with /ai:decide. See .canon/guidelines.md.
 
+  Standards-first data: adopt the recognized standard for every contract and identifier —
+  JSON Schema / OpenAPI / AsyncAPI for schemas and APIs; Wikidata, DOI, ORCID, LEI for
+  external identity plus UUID internally; Schema.org / RDF / ISO for vocabularies. An
+  invented scheme where a global one applies is a defect. See .canon/rules/09-standards.md.
+
+  System shape: modular monolith on a kernel/runtime core by default — one deployable, one
+  workspace package per DDD bounded context, events between contexts, query/mutation
+  separation always, full CQRS or event sourcing only where the domain warrants it.
+  Microservices only when explicitly requested. See .canon/rules/10-system-shape.md.
+
   Document naming: map every doc to a canonical type (RFC, ADR, ADD, TDD, Runbook…).
   Don't invent categories when one exists. RFC lifecycle is draft -> approved only.
 
